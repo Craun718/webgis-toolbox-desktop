@@ -1,35 +1,47 @@
-# WebGIS 工具箱
+# WebGIS Toolbox
 
-Linux 上的中文 egui 桌面应用，支持 OSGB 转 DOM / DSM、瓦片处理和 OSGB 模型裁剪。
+English | [简体中文](README.zh-CN.md)
+
+WebGIS Toolbox is a Linux desktop application for converting OSGB models to DOM and DSM rasters, processing map tiles, and clipping OSGB models.
+
+## Build and run
+
+Build with the Rust toolchain and a system linker.
 
 ```sh
 cargo build --locked
 ./target/debug/webgis-toolbox
 ```
 
-应用使用 Glow，支持 Wayland 和 X11。界面优先加载系统的思源黑体、Noto Sans CJK 或文泉驿微米黑，也可通过 `WEBGIS_CJK_FONT` 指定字体文件。工作区内的 Rust 库提供三项处理功能，构建使用 Rust 工具链和常规系统链接器。
+The Chinese-language egui interface uses Glow and supports Wayland and X11. It looks for Source Han Sans, Noto Sans CJK, or WenQuanYi Micro Hei on the system. Set `WEBGIS_CJK_FONT` to use a specific font file.
 
-- **OSGB 转 DOM / DSM**支持预检所选文件、LOD、坐标模式、范围和栅格尺寸。目录内存在 ContextCapture LOD 命名文件时，每个模型组选最高级别的全部分片。相对原点模式从 `metadata.xml` 读取坐标系及原点，支持手动覆盖。绝对坐标模式直接使用模型坐标，本地模式生成无 CRS 的栅格。默认像元尺寸为 0.05 个坐标单位。
-- **瓦片处理**支持 XYZ / TMS 单级拼接、生成金字塔及 STACTA，也可将带坐标系的 8 位 GeoTIFF 重投影为 256×256 WebMercatorQuad PNG 切片（默认 6–18 级）并生成 STACTA。GeoTIFF 切片使用 GDAL 3.9 或更新的动态运行库；XYZ 索引写到瓦片源目录。TMS 会将瓦片转换为 XYZ 行号后写入新目录，并生成索引。
-- **OSGB 模型裁剪**支持单文件和分页目录，可为目录指定入口路径。目录模式读取模型的 `metadata.xml`，单文件模式需填写坐标系和原点。裁剪范围支持 SHP、ZIP 内 SHP、KML 和 GeoJSON。ZIP 含多个 SHP 时先读取图层列表，再选择一个图层。
+## Tools
 
-## DOM / DSM 运行库
+- **OSGB to DOM and DSM.** Preview the selected files, level of detail (LOD), coordinate mode, extent, and raster dimensions. For inputs that follow the ContextCapture LOD naming convention, the converter uses all tiles at the highest LOD in each model group. Relative-origin mode reads the coordinate reference system (CRS) and origin from `metadata.xml` and accepts manual overrides. Absolute mode uses model coordinates directly. Local mode produces rasters without a CRS. The default pixel size is 0.05 coordinate units.
+- **Tile processing.** Mosaic a single XYZ or TMS level into a GeoTIFF, generate a tile pyramid, or build a STACTA index. The STACTA tool writes the index into the source directory for XYZ inputs. For TMS inputs it converts tile row numbers to XYZ and writes the tiles and index to a new directory. The map tiling tool reprojects georeferenced 8-bit GeoTIFFs into 256 × 256 WebMercatorQuad PNG tiles and writes a STACTA index. The default zoom range is 6–18.
+- **OSGB model clipping.** Clip a single file or a paged model directory. Directory inputs read `metadata.xml` and accept an optional OSGB entry path. Single-file inputs require the model CRS and origin. Clipping boundaries can be SHP, zipped SHP, KML, or GeoJSON. If a ZIP contains multiple shapefiles, load the layer list and select the layer to use.
 
-首次使用 DOM / DSM 时，应用动态加载 GDAL 3.9 或更新的预编译 `libgdal`。如运行库安装在非标准位置，可显式指定其路径。
+## GDAL runtime and raster output
+
+OSGB raster conversion and GeoTIFF map tiling load GDAL 3.9 or later at runtime. Set `WEBGIS_GDAL_LIBRARY` if the shared library is installed in a nonstandard location. The tile post-processing and clipping tools can run independently of GDAL.
 
 ```sh
-WEBGIS_GDAL_LIBRARY=/绝对路径/libgdal.so ./target/debug/webgis-toolbox
+WEBGIS_GDAL_LIBRARY=/path/to/libgdal.so ./target/debug/webgis-toolbox
 ```
 
-常规瓦片和裁剪可独立于 GDAL 运行。GeoTIFF 地图切片使用同一 GDAL 3.9+ 运行库。支持的栅格化输入以 ContextCapture v131 小端、无流压缩的 OSGB 为基线，支持 JPEG / PNG 内嵌或外部纹理。其他序列化版本、未支持的场景或纹理格式会提示文件和原因。
+The OSGB raster converter supports little-endian ContextCapture v131 files with uncompressed streams and embedded or external JPEG and PNG textures. Errors for unsupported versions, scenes, or textures identify the affected file.
 
-DOM / DSM 写出 `dsm.tif`、`dom.tif` 和 `run-report.json`。DSM 为 Float32，NoData 为 -9999。DOM 为 RGB，内部掩膜标记有效纹理。两个栅格均为分块 Deflate BigTIFF，尺寸允许时生成内部概览。只有明确确认后才会覆盖同名产物。DOM / DSM、地图切片和裁剪可在发布前取消。
+Conversion produces `dsm.tif`, `dom.tif`, and `run-report.json`. The Float32 DSM uses a NoData value of −9999. The RGB DOM uses an internal mask to mark valid texture pixels. Both rasters are tiled, DEFLATE-compressed BigTIFFs with internal overviews when their dimensions allow. Overwriting existing conversion outputs requires confirmation. Raster conversion, map tiling, and model clipping can be cancelled before results are published.
 
-## 测试
+## Tests
 
 ```sh
 cargo test --workspace --locked
 cargo test --locked gdal_writes_verified_products_and_cancellation_preserves_them -- --ignored
 ```
 
-第二条命令需要 GDAL 运行库。测试覆盖 LOD 选择、场景变换和原点偏移、高程遮挡、纹理方向、掩膜、NoData、分块一致性、取消和发布回滚。
+The GeoTIFF map tiling tests and the separately enabled DOM/DSM integration test require the GDAL runtime. Test coverage includes LOD selection, coordinate transforms and origin offsets, elevation occlusion, texture orientation, masks, NoData, block consistency, cancellation, and publication rollback.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
