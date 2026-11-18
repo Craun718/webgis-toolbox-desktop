@@ -1,0 +1,16 @@
+[package]
+name = "tiles-toolbox"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+clap = { version = "4.6.8", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+rustix = { version = "1.1.6", features = ["fs"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tiff-core = { version = "0.11.1", default-features = false }
+tiff-writer = { version = "0.11.1", default-features = false }
