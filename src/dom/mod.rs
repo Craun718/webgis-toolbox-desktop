@@ -1,4 +1,5 @@
 mod gdal;
+pub mod map_tiles;
 mod raster;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};

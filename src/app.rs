@@ -20,14 +20,14 @@ use webgis_toolbox::dom;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Raster,
-    Tiles,
+    Tiles(TileOp),
     Clip,
 }
 impl Tool {
     fn name(self) -> &'static str {
         match self {
             Self::Raster => "OSGB 转 DOM / DSM",
-            Self::Tiles => "瓦片后处理",
+            Self::Tiles(operation) => operation.name(),
             Self::Clip => "OSGB 模型裁剪",
         }
     }
@@ -36,7 +36,7 @@ impl Tool {
 pub struct App {
     selected: Tool,
     raster: RasterForm,
-    tiles: TileForm,
+    tiles: [TileForm; TileOp::ALL.len()],
     clip: ClipForm,
     worker: Option<Worker>,
     outcome: Option<Result<Outcome>>,
@@ -147,12 +147,24 @@ impl App {
                 resolution: "0.05".into(),
                 ..Default::default()
             },
-            tiles: TileForm::default(),
+            tiles: Default::default(),
             clip: ClipForm::default(),
             worker: None,
             outcome: None,
             font_loaded: install_font(ctx),
         }
+    }
+
+    fn tool_link(&mut self, ui: &mut Ui, tool: Tool) {
+        if ui
+            .selectable_label(self.selected == tool, tool.name())
+            .clicked()
+            && self.selected != tool
+        {
+            self.selected = tool;
+            self.outcome = None;
+        }
+        ui.add_space(4.);
     }
 
     fn poll(&mut self) {
@@ -235,9 +247,11 @@ impl App {
                     })
                 })?
             }
-            (Tool::Tiles, Action::Run) => {
-                let form = self.tiles.clone();
-                Worker::start(ctx, false, move |task| form.run(task))?
+            (Tool::Tiles(operation), Action::Run) => {
+                let form = self.tiles[operation as usize].clone();
+                Worker::start(ctx, operation == TileOp::MapTiles, move |task| {
+                    form.run(operation, task)
+                })?
             }
             _ => unreachable!(),
         });
@@ -263,17 +277,15 @@ impl eframe::App for App {
                 ui.heading("WebGIS 工具箱");
                 ui.add_space(16.);
                 ui.add_enabled_ui(!busy, |ui| {
-                    for tool in [Tool::Raster, Tool::Tiles, Tool::Clip] {
-                        if ui
-                            .selectable_label(self.selected == tool, tool.name())
-                            .clicked()
-                            && self.selected != tool
-                        {
-                            self.selected = tool;
-                            self.outcome = None;
+                    self.tool_link(ui, Tool::Raster);
+                    self.tool_link(ui, Tool::Clip);
+                    ui.add_space(8.);
+                    ui.label(RichText::new("瓦片处理").strong());
+                    ui.indent("tile_tools", |ui| {
+                        for operation in TileOp::ALL {
+                            self.tool_link(ui, Tool::Tiles(operation));
                         }
-                        ui.add_space(4.);
-                    }
+                    });
                 });
             });
         let mut action = None;
@@ -288,7 +300,7 @@ impl eframe::App for App {
                 ui.add_enabled_ui(!busy, |ui| {
                     match self.selected {
                         Tool::Raster => self.raster.ui(ui),
-                        Tool::Tiles => self.tiles.ui(ui),
+                        Tool::Tiles(operation) => self.tiles[operation as usize].ui(ui, operation),
                         Tool::Clip => {
                             if self.clip.ui(ui) {
                                 action = Some(Action::Layers);
@@ -297,7 +309,8 @@ impl eframe::App for App {
                     }
                     ui.add_space(10.);
                     ui.horizontal(|ui| {
-                        if self.selected != Tool::Tiles && ui.button("预检").clicked() {
+                        if !matches!(self.selected, Tool::Tiles(_)) && ui.button("预检").clicked()
+                        {
                             action = Some(Action::Preview);
                         }
                         if ui.button(RichText::new("开始处理").strong()).clicked() {
@@ -471,6 +484,10 @@ fn show_outcome(ui: &mut Ui, outcome: &Result<Outcome>) {
 
 fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.label(label);
+    text_edit(ui, value, hint)
+}
+
+fn text_edit(ui: &mut Ui, value: &mut String, hint: &str) -> bool {
     let changed = ui
         .add(
             egui::TextEdit::singleline(value)
@@ -480,6 +497,84 @@ fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
         .changed();
     ui.add_space(4.);
     changed
+}
+
+#[derive(Clone, Copy)]
+enum PathPicker {
+    File(&'static str, &'static [&'static str]),
+    FileOrFolder(&'static str, &'static [&'static str]),
+    Folder,
+    NewFolder,
+    SaveFile(&'static str, &'static [&'static str], &'static str),
+}
+
+fn path_field(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    picker: PathPicker,
+) -> bool {
+    let mut picked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        let current = Path::new(value.trim());
+        let dialog = || {
+            let mut dialog = rfd::FileDialog::new().set_title(label);
+            if let Some(directory) = current.ancestors().find(|path| path.is_dir()) {
+                dialog = dialog.set_directory(directory);
+            }
+            dialog
+        };
+        match picker {
+            PathPicker::File(name, extensions) | PathPicker::FileOrFolder(name, extensions) => {
+                if ui.small_button("选择文件…").clicked() {
+                    picked = dialog().add_filter(name, extensions).pick_file();
+                }
+            }
+            PathPicker::SaveFile(name, extensions, default_name) => {
+                if ui.small_button("选择保存位置…").clicked() {
+                    let file_name = current
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|_| !current.is_dir())
+                        .unwrap_or(default_name);
+                    picked = dialog()
+                        .add_filter(name, extensions)
+                        .set_file_name(file_name)
+                        .save_file();
+                }
+            }
+            PathPicker::NewFolder => {
+                if ui.small_button("指定新目录…").clicked() {
+                    let mut dialog = dialog();
+                    if let Some(name) = current.file_name().and_then(|name| name.to_str())
+                        && !current.is_dir()
+                    {
+                        dialog = dialog.set_file_name(name);
+                    }
+                    // 导出任务会创建目录，因此这里只选定目标路径。
+                    picked = dialog.save_file();
+                }
+            }
+            PathPicker::Folder => {}
+        }
+        if matches!(picker, PathPicker::Folder | PathPicker::FileOrFolder(..))
+            && ui.small_button("选择目录…").clicked()
+        {
+            picked = dialog().pick_folder();
+        }
+    });
+    let mut changed = false;
+    if let Some(path) = picked {
+        let selected = path.to_string_lossy();
+        changed = value != selected.as_ref();
+        if changed {
+            *value = selected.into_owned();
+        }
+    }
+    let edited = text_edit(ui, value, hint);
+    changed || edited
 }
 
 fn required_path(label: &str, value: &str) -> Result<PathBuf> {
@@ -516,15 +611,28 @@ struct RasterForm {
 
 impl RasterForm {
     fn ui(&mut self, ui: &mut Ui) {
-        field(ui, "模型输入", &mut self.input, "OSGB 文件或模型目录");
-        if field(ui, "输出目录", &mut self.output, "/路径/栅格成果") {
+        path_field(
+            ui,
+            "模型输入",
+            &mut self.input,
+            "OSGB 文件或模型目录",
+            PathPicker::FileOrFolder("OSGB", &["osgb"]),
+        );
+        if path_field(
+            ui,
+            "输出目录",
+            &mut self.output,
+            "/路径/栅格成果",
+            PathPicker::Folder,
+        ) {
             self.overwrite = false;
         }
-        field(
+        path_field(
             ui,
             "元数据",
             &mut self.metadata,
             "留空自动发现 metadata.xml",
+            PathPicker::File("XML", &["xml"]),
         );
         ui.horizontal_wrapped(|ui| {
             ui.label("坐标模式");
@@ -592,15 +700,22 @@ struct ClipForm {
 
 impl ClipForm {
     fn ui(&mut self, ui: &mut Ui) -> bool {
-        field(
+        path_field(
             ui,
             "模型输入",
             &mut self.model,
             "OSGB 文件或包含 metadata.xml 的目录",
+            PathPicker::FileOrFolder("OSGB", &["osgb"]),
         );
         ui.checkbox(&mut self.manual_entry, "手选目录的 OSGB 入口");
         if self.manual_entry {
-            field(ui, "入口文件", &mut self.entry, "目录内相对路径或绝对路径");
+            path_field(
+                ui,
+                "入口文件",
+                &mut self.entry,
+                "目录内相对路径或绝对路径",
+                PathPicker::File("OSGB", &["osgb"]),
+            );
         }
         ui.checkbox(&mut self.manual_reference, "设置单文件的模型坐标系与原点");
         if self.manual_reference {
@@ -612,11 +727,12 @@ impl ClipForm {
             );
             field(ui, "模型 XYZ 原点", &mut self.origin, "X, Y, Z");
         }
-        if field(
+        if path_field(
             ui,
             "裁剪范围",
             &mut self.boundary,
             "SHP、ZIP、KML 或 GeoJSON",
+            PathPicker::File("裁剪范围", &["shp", "zip", "kml", "geojson", "json"]),
         ) {
             self.layers.clear();
             self.layer = None;
@@ -643,7 +759,13 @@ impl ClipForm {
             &mut self.boundary_crs,
             "留空使用数据自带坐标系",
         );
-        if field(ui, "输出目录", &mut self.output, "绝对路径，父目录须存在") {
+        if path_field(
+            ui,
+            "输出目录",
+            &mut self.output,
+            "绝对路径，父目录须存在",
+            PathPicker::Folder,
+        ) {
             self.allow_nonempty = false;
         }
         ui.checkbox(
@@ -683,14 +805,29 @@ enum TileOp {
     Mosaic,
     Pyramid,
     Stacta,
+    MapTiles,
+}
+
+impl TileOp {
+    const ALL: [Self; 4] = [Self::Mosaic, Self::Pyramid, Self::Stacta, Self::MapTiles];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mosaic => "拼接 GeoTIFF",
+            Self::Pyramid => "生成金字塔",
+            Self::Stacta => "生成 STACTA",
+            Self::MapTiles => "地图切片",
+        }
+    }
 }
 
 #[derive(Clone)]
 struct TileForm {
-    operation: TileOp,
     input: String,
     scheme: Scheme,
     zoom: u8,
+    min_zoom: u8,
+    max_zoom: u8,
     targets: String,
     output: String,
     resampling: Option<Resampling>,
@@ -703,10 +840,11 @@ struct TileForm {
 impl Default for TileForm {
     fn default() -> Self {
         Self {
-            operation: TileOp::Mosaic,
             input: String::new(),
             scheme: Scheme::Xyz,
             zoom: 0,
+            min_zoom: 6,
+            max_zoom: 18,
             targets: String::new(),
             output: String::new(),
             resampling: None,
@@ -719,31 +857,44 @@ impl Default for TileForm {
 }
 
 impl TileForm {
-    fn ui(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            for (op, label) in [
-                (TileOp::Mosaic, "拼接 GeoTIFF"),
-                (TileOp::Pyramid, "生成金字塔"),
-                (TileOp::Stacta, "生成 STACTA"),
-            ] {
-                ui.radio_value(&mut self.operation, op, label);
-            }
-        });
-        field(ui, "瓦片根目录", &mut self.input, "包含 z/x/y 图像的目录");
-        ui.horizontal(|ui| {
-            ui.label("瓦片行号");
-            ui.radio_value(&mut self.scheme, Scheme::Xyz, "XYZ");
-            ui.radio_value(&mut self.scheme, Scheme::Tms, "TMS");
-        });
-        if self.operation != TileOp::Stacta {
+    fn ui(&mut self, ui: &mut Ui, operation: TileOp) {
+        if operation == TileOp::MapTiles {
+            path_field(
+                ui,
+                "GeoTIFF",
+                &mut self.input,
+                "带坐标系和地理定位的 .tif / .tiff",
+                PathPicker::File("GeoTIFF", &["tif", "tiff"]),
+            );
+        } else {
+            path_field(
+                ui,
+                "瓦片根目录",
+                &mut self.input,
+                "包含 z/x/y 图像的目录",
+                PathPicker::Folder,
+            );
+            ui.horizontal(|ui| {
+                ui.label("瓦片行号");
+                ui.radio_value(&mut self.scheme, Scheme::Xyz, "XYZ");
+                ui.radio_value(&mut self.scheme, Scheme::Tms, "TMS");
+            });
+        }
+        if matches!(operation, TileOp::Mosaic | TileOp::Pyramid) {
             ui.horizontal(|ui| {
                 ui.label("源级别");
                 ui.add(egui::DragValue::new(&mut self.zoom).range(0..=30));
             });
         }
-        match self.operation {
+        match operation {
             TileOp::Mosaic => {
-                field(ui, "GeoTIFF 输出文件", &mut self.output, "/路径/mosaic.tif");
+                path_field(
+                    ui,
+                    "GeoTIFF 输出文件",
+                    &mut self.output,
+                    "/路径/mosaic.tif",
+                    PathPicker::SaveFile("GeoTIFF", &["tif", "tiff"], "mosaic.tif"),
+                );
             }
             TileOp::Pyramid => {
                 field(ui, "目标级别", &mut self.targets, "例如 0-2,4");
@@ -771,7 +922,13 @@ impl TileForm {
                 if self.format == Format::Jpeg {
                     field(ui, "JPEG 背景", &mut self.background, "#RRGGBB");
                 }
-                field(ui, "金字塔输出目录", &mut self.output, "新目录");
+                path_field(
+                    ui,
+                    "金字塔输出目录",
+                    &mut self.output,
+                    "新目录",
+                    PathPicker::NewFolder,
+                );
             }
             TileOp::Stacta => {
                 field(
@@ -782,18 +939,67 @@ impl TileForm {
                 );
                 field(ui, "STAC ID", &mut self.id, "留空使用瓦片根目录名称");
                 if self.scheme == Scheme::Tms {
-                    field(ui, "XYZ 输出目录", &mut self.output, "新目录");
+                    path_field(
+                        ui,
+                        "XYZ 输出目录",
+                        &mut self.output,
+                        "新目录",
+                        PathPicker::NewFolder,
+                    );
                 } else {
                     ui.label("在源目录生成 stacta.json。");
                 }
             }
+            TileOp::MapTiles => {
+                ui.horizontal(|ui| {
+                    ui.label("级别");
+                    ui.label("最小");
+                    ui.add(
+                        egui::DragValue::new(&mut self.min_zoom)
+                            .range(0..=dom::map_tiles::MAX_ZOOM),
+                    );
+                    ui.label("最大");
+                    ui.add(
+                        egui::DragValue::new(&mut self.max_zoom)
+                            .range(0..=dom::map_tiles::MAX_ZOOM),
+                    );
+                });
+                field(
+                    ui,
+                    "时间（RFC 3339）",
+                    &mut self.datetime,
+                    "例如 2026-01-01T00:00:00Z",
+                );
+                field(ui, "STAC ID", &mut self.id, "留空使用输出目录名");
+                path_field(
+                    ui,
+                    "输出目录",
+                    &mut self.output,
+                    "新目录",
+                    PathPicker::NewFolder,
+                );
+            }
         }
     }
 
-    fn run(self, task: &TaskContext) -> Result<Outcome> {
-        let input = required_path("瓦片根目录", &self.input)?;
-        task.update("扫描瓦片", None);
-        let output = match self.operation {
+    fn run(self, operation: TileOp, task: &TaskContext) -> Result<Outcome> {
+        let input = required_path(
+            if operation == TileOp::MapTiles {
+                "GeoTIFF"
+            } else {
+                "瓦片根目录"
+            },
+            &self.input,
+        )?;
+        task.update(
+            if operation == TileOp::MapTiles {
+                "准备地图切片"
+            } else {
+                "扫描瓦片"
+            },
+            None,
+        );
+        let output = match operation {
             TileOp::Mosaic => {
                 let output = required_path("GeoTIFF 输出文件", &self.output)?;
                 let index = Index::scan(&input, self.scheme)?;
@@ -837,6 +1043,38 @@ impl TileForm {
                     optional_text(&self.id),
                 )?;
                 export.unwrap_or(input).join("stacta.json")
+            }
+            TileOp::MapTiles => {
+                let output = required_path("输出目录", &self.output)?;
+                let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
+                    .context("时间须符合 RFC 3339")?;
+                let request = dom::map_tiles::Request {
+                    input,
+                    output: output.clone(),
+                    min_zoom: self.min_zoom,
+                    max_zoom: self.max_zoom,
+                    datetime,
+                    id: optional_text(&self.id),
+                };
+                let levels = dom::map_tiles::run(
+                    &request,
+                    &task.cancelled,
+                    |stage, fraction| task.update(stage, fraction),
+                    || task.publish(),
+                )?;
+                let missing: Vec<_> = (self.min_zoom..=self.max_zoom)
+                    .filter(|z| !levels.contains(z))
+                    .map(|z| z.to_string())
+                    .collect();
+                let details = if missing.is_empty() {
+                    None
+                } else {
+                    Some(format!("以下级别没有有效瓦片：{}", missing.join("、")))
+                };
+                return Ok(Outcome::Artifacts {
+                    paths: vec![output.canonicalize()?],
+                    details,
+                });
             }
         };
         Ok(Outcome::Artifacts {

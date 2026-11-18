@@ -8,12 +8,24 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-type Handle = *mut c_void;
+pub(super) type Handle = *mut c_void;
 type Strings = *const *const c_char;
 type Callback = unsafe extern "C" fn(c_double, *const c_char, Handle) -> c_int;
 const BYTE: c_int = 1;
 const FLOAT32: c_int = 6;
 const PER_DATASET: c_int = 2;
+#[repr(C)]
+pub(super) struct RasterIoExtraArg {
+    version: c_int,
+    resampling: c_int,
+    progress: Option<Callback>,
+    progress_data: Handle,
+    floating_window: c_int,
+    x_offset: c_double,
+    y_offset: c_double,
+    x_size: c_double,
+    y_size: c_double,
+}
 pub const NODATA: f32 = -9999.0;
 pub const TILE: usize = 256;
 
@@ -21,7 +33,7 @@ macro_rules! gdal_api {
     ($($name:ident($($arg:ty),*) $(-> $ret:ty)?;)+) => {
         #[allow(non_snake_case)]
         pub struct Gdal {
-            $($name: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)+
+            $(pub(super) $name: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)+
             _library: Library,
         }
         impl Gdal {
@@ -42,17 +54,23 @@ gdal_api! {
     GDALGetDriverByName(*const c_char) -> Handle;
     GDALCreate(Handle, *const c_char, c_int, c_int, c_int, c_int, Strings) -> Handle;
     GDALOpen(*const c_char, c_int) -> Handle;
+    GDALAutoCreateWarpedVRT(Handle, *const c_char, *const c_char, c_int, c_double, Handle) -> Handle;
+    GDALTranslateOptionsNew(*mut *mut c_char, Handle) -> Handle;
+    GDALTranslateOptionsFree(Handle);
+    GDALTranslate(*const c_char, Handle, Handle, *mut c_int) -> Handle;
+    GDALGetProjectionRef(Handle) -> *const c_char;
     GDALClose(Handle) -> c_int;
     GDALSetGeoTransform(Handle, *mut c_double) -> c_int;
     GDALGetGeoTransform(Handle, *mut c_double) -> c_int;
     GDALSetSpatialRef(Handle, Handle) -> c_int;
     GDALGetSpatialRef(Handle) -> Handle;
     GDALGetRasterXSize(Handle) -> c_int;
-    GDALGetRasterYSize(Handle) -> c_int;
     GDALGetRasterCount(Handle) -> c_int;
     GDALGetRasterBand(Handle, c_int) -> Handle;
     GDALGetRasterDataType(Handle) -> c_int;
     GDALGetRasterColorInterpretation(Handle) -> c_int;
+    GDALSetRasterColorInterpretation(Handle, c_int) -> c_int;
+    GDALGetRasterYSize(Handle) -> c_int;
     GDALGetMetadataItem(Handle, *const c_char, *const c_char) -> *const c_char;
     GDALSetRasterNoDataValue(Handle, c_double) -> c_int;
     GDALGetRasterNoDataValue(Handle, *mut c_int) -> c_double;
@@ -62,6 +80,7 @@ gdal_api! {
     GDALGetOverviewCount(Handle) -> c_int;
     GDALGetBlockSize(Handle, *mut c_int, *mut c_int);
     GDALRasterIO(Handle, c_int, c_int, c_int, c_int, c_int, Handle, c_int, c_int, c_int, c_int, c_int) -> c_int;
+    GDALRasterIOEx(Handle, c_int, c_int, c_int, c_int, c_int, Handle, c_int, c_int, c_int, i64, i64, *mut RasterIoExtraArg) -> c_int;
     GDALBuildOverviews(Handle, *const c_char, c_int, *const c_int, c_int, *const c_int, Option<Callback>, Handle) -> c_int;
     CPLGetLastErrorMsg() -> *const c_char;
     CPLGetThreadLocalConfigOption(*const c_char, *const c_char) -> *const c_char;
@@ -73,6 +92,93 @@ gdal_api! {
 }
 
 impl Gdal {
+    pub(super) fn open(&self, path: &Path) -> Result<Dataset<'_>> {
+        let name = CString::new(path.as_os_str().as_bytes()).context("路径包含空字符")?;
+        let handle = unsafe { (self.GDALOpen)(name.as_ptr(), 0) };
+        self.opened(handle, &format!("打开 GeoTIFF {}", path.display()))
+    }
+
+    /// 将第一波段的掩膜作为独立波段按需读取。
+    pub(super) fn mask_vrt<'a>(&'a self, source: &'a Dataset<'_>) -> Result<Dataset<'a>> {
+        let mut args = [c"-of", c"VRT", c"-b", c"mask,1", c"-mask", c"none"]
+            .map(|arg| arg.as_ptr().cast_mut())
+            .to_vec();
+        args.push(ptr::null_mut());
+        let options = unsafe { (self.GDALTranslateOptionsNew)(args.as_mut_ptr(), ptr::null_mut()) };
+        ensure!(!options.is_null(), "创建掩膜 VRT 参数失败");
+        let handle = unsafe {
+            let handle =
+                (self.GDALTranslate)(c"".as_ptr(), source.handle, options, ptr::null_mut());
+            (self.GDALTranslateOptionsFree)(options);
+            handle
+        };
+        self.opened(handle, "创建掩膜 VRT")
+    }
+
+    pub(super) fn warp_mercator<'a>(&'a self, source: &'a Dataset<'_>) -> Result<Dataset<'a>> {
+        let handle = unsafe {
+            (self.GDALAutoCreateWarpedVRT)(
+                source.handle,
+                ptr::null(),
+                c"EPSG:3857".as_ptr(),
+                1,
+                0.0,
+                ptr::null_mut(),
+            )
+        };
+        self.opened(handle, "重投影到 EPSG:3857")
+    }
+
+    fn opened(&self, handle: Handle, operation: &str) -> Result<Dataset<'_>> {
+        if handle.is_null() {
+            return Err(self.error(operation));
+        }
+        Ok(Dataset { api: self, handle })
+    }
+
+    pub(super) fn read_resampled(
+        &self,
+        band: Handle,
+        rect: [c_int; 4],
+        size: [c_int; 2],
+        pixels: &mut [u8],
+        resampling: c_int,
+    ) -> Result<()> {
+        let [x, y, width, height] = rect;
+        let [buffer_width, buffer_height] = size;
+        let mut extra = RasterIoExtraArg {
+            version: 1,
+            resampling,
+            progress: None,
+            progress_data: ptr::null_mut(),
+            floating_window: 0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            x_size: 0.0,
+            y_size: 0.0,
+        };
+        self.check(
+            unsafe {
+                (self.GDALRasterIOEx)(
+                    band,
+                    0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    pixels.as_mut_ptr().cast(),
+                    buffer_width,
+                    buffer_height,
+                    BYTE,
+                    0,
+                    0,
+                    &mut extra,
+                )
+            },
+            "按地图级别重采样栅格失败",
+        )
+    }
+
     pub fn load() -> Result<&'static Self> {
         static API: std::sync::OnceLock<Gdal> = std::sync::OnceLock::new();
         if let Some(api) = API.get() {
@@ -114,12 +220,12 @@ impl Gdal {
         )
     }
 
-    fn error(&self, operation: &str) -> anyhow::Error {
+    pub(super) fn error(&self, operation: &str) -> anyhow::Error {
         let detail = unsafe { CStr::from_ptr((self.CPLGetLastErrorMsg)()) }.to_string_lossy();
         anyhow::anyhow!("{operation}：{detail}")
     }
 
-    fn check(&self, status: c_int, operation: &str) -> Result<()> {
+    pub(super) fn check(&self, status: c_int, operation: &str) -> Result<()> {
         if status != 0 {
             return Err(self.error(operation));
         }
@@ -210,6 +316,15 @@ impl Gdal {
                 )?;
             }
             if rgb {
+                for (index, interpretation) in [(1, 3), (2, 4), (3, 5)] {
+                    self.check(
+                        (self.GDALSetRasterColorInterpretation)(
+                            dataset.band(index),
+                            interpretation,
+                        ),
+                        "设置 DOM 颜色解释失败",
+                    )?;
+                }
                 self.check(
                     (self.GDALCreateDatasetMaskBand)(handle, PER_DATASET),
                     "创建 DOM 掩膜失败",
@@ -364,7 +479,7 @@ impl Drop for Config<'_> {
 
 pub struct Srs<'a> {
     api: &'a Gdal,
-    handle: Handle,
+    pub(super) handle: Handle,
 }
 impl Drop for Srs<'_> {
     fn drop(&mut self) {
@@ -374,10 +489,10 @@ impl Drop for Srs<'_> {
 
 pub struct Dataset<'a> {
     api: &'a Gdal,
-    handle: Handle,
+    pub(super) handle: Handle,
 }
 impl Dataset<'_> {
-    fn band(&self, index: i32) -> Handle {
+    pub(super) fn band(&self, index: i32) -> Handle {
         unsafe { (self.api.GDALGetRasterBand)(self.handle, index) }
     }
 

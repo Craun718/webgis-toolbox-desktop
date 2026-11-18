@@ -241,6 +241,7 @@ fn parse_coordinate(value: &str, path: &Path) -> Result<u32> {
         .with_context(|| format!("坐标越界：{}", path.display()))
 }
 
+#[derive(Clone, Copy)]
 pub struct Bounds {
     pub min_x: u32,
     pub min_y: u32,
@@ -257,12 +258,16 @@ impl Bounds {
             max_y: 0,
         };
         for &(x, y) in level.keys() {
-            bounds.min_x = bounds.min_x.min(x);
-            bounds.max_x = bounds.max_x.max(x);
-            bounds.min_y = bounds.min_y.min(y);
-            bounds.max_y = bounds.max_y.max(y);
+            bounds.include(x, y);
         }
         bounds
+    }
+
+    pub fn include(&mut self, x: u32, y: u32) {
+        self.min_x = self.min_x.min(x);
+        self.max_x = self.max_x.max(x);
+        self.min_y = self.min_y.min(y);
+        self.max_y = self.max_y.max(y);
     }
 }
 

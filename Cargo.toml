@@ -19,6 +19,7 @@ rstar = "0.12"
 rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
 walkdir = "2"
+rfd = "0.16"
 
 [workspace]
 members = ["crates/core", "crates/tiles"]
