@@ -23,6 +23,7 @@ enum Tool {
     Cog,
     Tiles(TileOp),
     Clip,
+    Settings,
 }
 impl Tool {
     fn name(self) -> &'static str {
@@ -31,6 +32,7 @@ impl Tool {
             Self::Raster => "OSGB 转 DOM / DSM",
             Self::Tiles(operation) => operation.name(),
             Self::Clip => "OSGB 模型裁剪",
+            Self::Settings => "设置",
         }
     }
 }
@@ -314,6 +316,9 @@ impl eframe::App for App {
                             self.tool_link(ui, Tool::Tiles(operation));
                         }
                     });
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                        self.tool_link(ui, Tool::Settings);
+                    });
                 });
             });
         let mut action = None;
@@ -325,6 +330,25 @@ impl eframe::App for App {
                     ui.label("Install a Chinese font or set WEBGIS_CJK_FONT to a font path.");
                 }
                 ui.add_space(14.);
+                if self.selected == Tool::Settings {
+                    ui.heading("关于");
+                    ui.add_space(8.);
+                    egui::Grid::new("about_project").show(ui, |ui| {
+                        ui.label("作者");
+                        ui.label(env!("CARGO_PKG_AUTHORS"));
+                        ui.end_row();
+
+                        ui.label("许可证类型");
+                        ui.label(env!("CARGO_PKG_LICENSE"));
+                        ui.end_row();
+
+                        let repository = env!("CARGO_PKG_REPOSITORY");
+                        ui.label("项目地址");
+                        ui.hyperlink_to(repository, repository);
+                        ui.end_row();
+                    });
+                    return;
+                }
                 ui.add_enabled_ui(!busy, |ui| {
                     match self.selected {
                         Tool::Raster => self.raster.ui(ui),
@@ -335,6 +359,7 @@ impl eframe::App for App {
                                 action = Some(Action::Layers);
                             }
                         }
+                        Tool::Settings => unreachable!(),
                     }
                     ui.add_space(10.);
                     ui.horizontal(|ui| {
