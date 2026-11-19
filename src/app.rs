@@ -141,7 +141,7 @@ impl Worker {
 
 impl App {
     pub fn new(ctx: &EguiContext) -> Self {
-        ctx.all_styles_mut(|style| style.spacing.button_padding += egui::vec2(2.0, 2.0));
+        ctx.all_styles_mut(|style| style.spacing.button_padding += egui::vec2(4.0, 4.0));
         Self {
             selected: Tool::Raster,
             raster: RasterForm {
