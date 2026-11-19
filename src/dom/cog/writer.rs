@@ -6,6 +6,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 use tiff::tags::Tag;
+use webgis_core::task_pool::{self, ThreadPool};
 
 pub(super) struct Field {
     tag: Tag,
@@ -84,6 +85,7 @@ pub(super) fn write(
     source: &mut Source,
     cancelled: &AtomicBool,
     progress: impl Fn(Progress),
+    pool: Option<&ThreadPool>,
 ) -> Result<()> {
     let mut levels = Vec::new();
     let mut size = source.size;
@@ -105,36 +107,57 @@ pub(super) fn write(
     let mut pos = directories(out, &mut levels, source)?;
     let total: u64 = levels.iter().map(|level| level.count).sum();
     let mut completed = 0;
-    let mut pixels = vec![0; TILE * TILE * source.pixel_bytes()];
-    let mut mask = vec![0; TILE * TILE / 8];
+    let mut buffers: Vec<_> = (0..task_pool::width(pool))
+        .map(|_| {
+            (
+                vec![0; TILE * TILE * source.pixel_bytes()],
+                vec![0; TILE * TILE / 8],
+            )
+        })
+        .collect();
     let mut image_index = Vec::with_capacity(256);
     let mut mask_index = Vec::with_capacity(256);
     for (number, level) in levels.iter().enumerate().rev() {
         let mut start = 0;
         update(&progress, number, completed, total);
-        for index in 0..level.count {
-            check_cancelled(cancelled)?;
-            let col = (index % u64::from(level.grid[0])) as u32;
-            let row = (index / u64::from(level.grid[0])) as u32;
-            let origin = [col * TILE as u32, row * TILE as u32];
-            sample(source, level.size, number, origin, &mut pixels, &mut mask)?;
-            image_index.push(block(out, &mut pos, &pixels)?);
-            if masked {
-                mask_index.push(block(out, &mut pos, &mask)?);
+        for batch in task_pool::batches(0..level.count, pool) {
+            let mut sampled = Vec::with_capacity(batch.len());
+            for (index, (pixels, mask)) in batch.into_iter().zip(&mut buffers) {
+                check_cancelled(cancelled)?;
+                let col = (index % u64::from(level.grid[0])) as u32;
+                let row = (index / u64::from(level.grid[0])) as u32;
+                let origin = [col * TILE as u32, row * TILE as u32];
+                sample(source, level.size, number, origin, pixels, mask)?;
+                sampled.push((index, pixels.as_slice(), mask.as_slice()));
             }
-            if image_index.len() == image_index.capacity() || index + 1 == level.count {
-                level.image.patch(out, start, &image_index)?;
-                if let Some(mask) = level.mask {
-                    mask.patch(out, start, &mask_index)?;
+            let blocks = task_pool::map(pool, sampled, |(index, pixels, mask)| {
+                check_cancelled(cancelled)?;
+                Ok::<_, anyhow::Error>((
+                    index,
+                    compress(pixels)?,
+                    masked.then(|| compress(mask)).transpose()?,
+                ))
+            })?;
+            for (index, pixels, mask) in blocks {
+                check_cancelled(cancelled)?;
+                image_index.push(block(out, &mut pos, &pixels)?);
+                if let Some(mask) = mask {
+                    mask_index.push(block(out, &mut pos, &mask)?);
                 }
-                out.seek(SeekFrom::Start(pos))?;
-                start = index + 1;
-                image_index.clear();
-                mask_index.clear();
-            }
-            completed += 1;
-            if completed % 16 == 0 || index + 1 == level.count {
-                update(&progress, number, completed, total);
+                if image_index.len() == image_index.capacity() || index + 1 == level.count {
+                    level.image.patch(out, start, &image_index)?;
+                    if let Some(mask) = level.mask {
+                        mask.patch(out, start, &mask_index)?;
+                    }
+                    out.seek(SeekFrom::Start(pos))?;
+                    start = index + 1;
+                    image_index.clear();
+                    mask_index.clear();
+                }
+                completed += 1;
+                if completed % 16 == 0 || index + 1 == level.count {
+                    update(&progress, number, completed, total);
+                }
             }
         }
     }
@@ -183,15 +206,18 @@ fn sample(
     Ok(())
 }
 
-fn block(out: &mut impl Write, position: &mut u64, raw: &[u8]) -> Result<[u64; 2]> {
+fn compress(raw: &[u8]) -> Result<Vec<u8>> {
     let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
     compressor.write_all(raw)?;
-    let bytes = compressor.finish()?;
+    Ok(compressor.finish()?)
+}
+
+fn block(out: &mut impl Write, position: &mut u64, bytes: &[u8]) -> Result<[u64; 2]> {
     let length = u32::try_from(bytes.len())?;
     let offset = *position + 4;
     // GDAL 可通过块头和块尾识别连续的影像与掩膜数据。
     out.write_all(&length.to_le_bytes())?;
-    out.write_all(&bytes)?;
+    out.write_all(bytes)?;
     out.write_all(&bytes[bytes.len() - 4..])?;
     *position += u64::from(length) + 8;
     Ok([offset, u64::from(length)])

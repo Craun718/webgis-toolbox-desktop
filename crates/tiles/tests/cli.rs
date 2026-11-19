@@ -471,3 +471,82 @@ fn stacta_reads_webp_and_jpeg_pyramids() {
         }
     }
 }
+
+#[test]
+fn parallel_mosaic_pyramid_and_stacta_match_serial_outputs() {
+    use tiles_toolbox::{
+        mosaic,
+        pyramid::{self, Options},
+        stacta,
+        tiles::{Format, Index, Scheme},
+    };
+
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fixture(root);
+    let input = root.join("tms");
+    let index = Index::scan(&input, Scheme::Tms).unwrap();
+    let level = index.level(2).unwrap();
+    let pool = webgis_core::task_pool::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    let serial = root.join("serial.tif");
+    let parallel = root.join("parallel.tif");
+    mosaic::run(level, 2, &serial).unwrap();
+    mosaic::run_with_pool(level, 2, &parallel, Some(&pool)).unwrap();
+    assert_eq!(fs::read(serial).unwrap(), fs::read(parallel).unwrap());
+
+    let options = Options {
+        scheme: Scheme::Tms,
+        source_zoom: 2,
+        zooms: [0, 1, 2, 3].into_iter().collect(),
+        resampling: None,
+        format: Format::Png,
+        background: [255; 3],
+    };
+    let serial = root.join("serial-pyramid");
+    let parallel = root.join("parallel-pyramid");
+    pyramid::run(level, &options, &serial).unwrap();
+    pyramid::run_with_pool(level, &options, &parallel, Some(&pool)).unwrap();
+    assert_eq!(snapshot(&serial), snapshot(&parallel));
+
+    let serial = root.join("serial-stacta");
+    let parallel = root.join("parallel-stacta");
+    let date = chrono::DateTime::parse_from_rfc3339(DATETIME).unwrap();
+    let id = || Some("test".into());
+    stacta::run(&input, Scheme::Tms, Some(&serial), date, id()).unwrap();
+    stacta::run_with_pool(
+        &input,
+        Scheme::Tms,
+        Some(&parallel),
+        date,
+        id(),
+        Some(&pool),
+    )
+    .unwrap();
+    assert_eq!(snapshot(&serial), snapshot(&parallel));
+}

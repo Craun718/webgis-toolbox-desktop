@@ -1,4 +1,5 @@
 use super::{Boundary, Reference, osgb, vector};
+use crate::task_pool::{self, ThreadPool};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -79,8 +80,18 @@ pub fn preflight_cancelable(
 pub fn run(
     request: &Request,
     cancelled: &AtomicBool,
+    progress: impl FnMut(Progress),
+    before_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<Report, String> {
+    run_with_pool(request, cancelled, progress, before_publish, None)
+}
+
+pub fn run_with_pool(
+    request: &Request,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress),
     before_publish: impl FnOnce() -> Result<(), String>,
+    pool: Option<&ThreadPool>,
 ) -> Result<Report, String> {
     check_cancelled(cancelled)?;
     let prepared = prepare(request)?;
@@ -108,69 +119,84 @@ pub fn run(
         return Err("模型入口与 metadata.xml 冲突".into());
     }
     write_file(&stage.join("metadata.xml"), &prepared.metadata)?;
-    while let Some(relative) = pending.pop_front() {
+    while !pending.is_empty() {
+        let batch: Vec<_> = pending
+            .drain(..pending.len().min(task_pool::width(pool)))
+            .collect();
         check_cancelled(cancelled)?;
         progress(Progress {
             completed,
             discovered: seen.len(),
-            file: relative.clone(),
+            file: batch[0].clone(),
         });
-        let file = ensure_input(&prepared.root, &relative)?;
-        let input = fs::read(&file).map_err(|err| file_error(&file, err))?;
-        let clipped = osgb::rewrite_cancelable(&input, Some(&prepared.boundary), Some(cancelled))
-            .map_err(|err| file_error(&file, err))?;
-        if prepared.single && !clipped.info.pages.is_empty() {
-            return Err(format!("{} 含外部分页，请选择模型目录", file.display()));
-        }
-        for name in &clipped.info.pages {
-            let path = resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
-            if vector::extension(&path) != "osgb" {
-                return Err(format!("{} 引用了非 OSGB 分页 {name}", file.display()));
-            }
-            if seen.insert(path.clone()) {
-                pending.push_back(path);
-            }
-        }
-        for name in &clipped.info.textures {
+        let models = task_pool::map(pool, batch, |relative| {
             check_cancelled(cancelled)?;
-            let path = resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
-            if vector::extension(&path) == "osgb" || path == Path::new("metadata.xml") {
-                return Err(format!(
-                    "{} 的纹理路径与模型或元数据冲突：{name}",
-                    file.display()
-                ));
+            let file = ensure_input(&prepared.root, &relative)?;
+            let input = fs::read(&file).map_err(|err| file_error(&file, err))?;
+            let clipped =
+                osgb::rewrite_cancelable(&input, Some(&prepared.boundary), Some(cancelled))
+                    .map_err(|err| file_error(&file, err))?;
+            let verified = osgb::inspect(&clipped.bytes, Some(cancelled))
+                .map_err(|err| file_error(&file, err))?;
+            if verified.triangles != clipped.info.triangles
+                || verified.pages != clipped.info.pages
+                || verified.textures != clipped.info.textures
+            {
+                return Err(format!("输出校验失败：{}", file.display()));
             }
-            if textures.insert(path.clone()) {
-                let source = ensure_input(&prepared.root, &path)?;
-                let target = stage.join(path);
-                create_parent(&target)?;
-                let mut input = fs::File::open(&source).map_err(|err| file_error(&source, err))?;
-                let mut out = fs::File::options()
-                    .create_new(true)
-                    .write(true)
-                    .open(&target)
-                    .map_err(|err| file_error(&target, err))?;
-                if io::copy(&mut input, &mut out).map_err(|err| file_error(&target, err))? == 0 {
-                    return Err(format!("纹理文件为空：{}", source.display()));
+            Ok((relative, file, clipped))
+        })?;
+        for (relative, file, clipped) in models {
+            check_cancelled(cancelled)?;
+            if prepared.single && !clipped.info.pages.is_empty() {
+                return Err(format!("{} 含外部分页，请选择模型目录", file.display()));
+            }
+            for name in &clipped.info.pages {
+                let path =
+                    resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
+                if vector::extension(&path) != "osgb" {
+                    return Err(format!("{} 引用了非 OSGB 分页 {name}", file.display()));
+                }
+                if seen.insert(path.clone()) {
+                    pending.push_back(path);
                 }
             }
+            for name in &clipped.info.textures {
+                check_cancelled(cancelled)?;
+                let path =
+                    resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
+                if vector::extension(&path) == "osgb" || path == Path::new("metadata.xml") {
+                    return Err(format!(
+                        "{} 的纹理路径与模型或元数据冲突：{name}",
+                        file.display()
+                    ));
+                }
+                if textures.insert(path.clone()) {
+                    let source = ensure_input(&prepared.root, &path)?;
+                    let target = stage.join(path);
+                    create_parent(&target)?;
+                    let mut input =
+                        fs::File::open(&source).map_err(|err| file_error(&source, err))?;
+                    let mut out = fs::File::options()
+                        .create_new(true)
+                        .write(true)
+                        .open(&target)
+                        .map_err(|err| file_error(&target, err))?;
+                    if io::copy(&mut input, &mut out).map_err(|err| file_error(&target, err))? == 0
+                    {
+                        return Err(format!("纹理文件为空：{}", source.display()));
+                    }
+                }
+            }
+            write_file(&stage.join(&relative), &clipped.bytes)?;
+            completed += 1;
+            triangles += clipped.info.triangles;
+            progress(Progress {
+                completed,
+                discovered: seen.len(),
+                file: relative,
+            });
         }
-        let verified =
-            osgb::inspect(&clipped.bytes, Some(cancelled)).map_err(|err| file_error(&file, err))?;
-        if verified.triangles != clipped.info.triangles
-            || verified.pages != clipped.info.pages
-            || verified.textures != clipped.info.textures
-        {
-            return Err(format!("输出校验失败：{}", file.display()));
-        }
-        write_file(&stage.join(&relative), &clipped.bytes)?;
-        completed += 1;
-        triangles += clipped.info.triangles;
-        progress(Progress {
-            completed,
-            discovered: seen.len(),
-            file: relative,
-        });
     }
     check_cancelled(cancelled)?;
     if triangles == 0 {

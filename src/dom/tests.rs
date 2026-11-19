@@ -324,6 +324,28 @@ fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
     request.resolution = 0.01;
     let cancelled = AtomicBool::new(false);
     let paths = run(&request, &cancelled, |_| {}, || Ok(()))?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    request.overwrite = true;
+    let expected: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+    let parallel = run_with_pool(&request, &cancelled, |_| {}, || Ok(()), Some(&pool))?;
+    assert_eq!(paths, parallel);
+    for (path, bytes) in paths.iter().zip(expected) {
+        assert_eq!(fs::read(path)?, bytes);
+    }
+    request.output = temp.path().join("cancelled");
+    let result = run_with_pool(
+        &request,
+        &cancelled,
+        |p| {
+            if p.stage.starts_with("栅格化") {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        },
+        || panic!("取消后仍尝试发布"),
+        Some(&pool),
+    );
+    assert!(result.unwrap_err().to_string().contains("已取消"));
+    assert_eq!(fs::read_dir(&request.output)?.count(), 0);
     let base_dir = |path| -> Result<_> { Ok(Decoder::new(fs::File::open(path)?)?) };
     let mut dsm = base_dir(&paths[0])?;
     let mut dom = base_dir(&paths[1])?;

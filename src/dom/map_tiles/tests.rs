@@ -581,3 +581,68 @@ fn rejects_missing_crs_all_transparent_and_preserves_conflicts_and_cancellation(
     assert!(!cancelled_output.exists());
     Ok(())
 }
+
+#[test]
+fn parallel_sampling_preserves_tiles_and_index_with_overlapping_candidate_ranges() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("wrap.tif");
+    make_rgb(
+        &input,
+        Some("EPSG:4326"),
+        [175., 32. / 512., 0., 12., 0., -24. / 512.],
+        false,
+    )?;
+    let source = Source::open(&input)?;
+    let bounds = Grid::new(&source)?.bounds(source.size)?;
+    assert_eq!(bounds.len(), 2);
+    assert!(
+        bounds
+            .iter()
+            .all(|&bound| candidate_tiles(bound, 0).min_x == 0)
+    );
+    assert_eq!(candidate_ranges(&bounds, 0).len(), 1);
+    assert_eq!(candidate_ranges(&bounds, 3).len(), 2);
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let mut request = tile_request(input, root.path().join("serial"), 0);
+    request.max_zoom = 3;
+    request.id = Some("test".into());
+    let cancelled = AtomicBool::new(false);
+    let serial = run(&request, &cancelled, |_, _| {}, || Ok(()))?;
+    let serial_output = request.output;
+    request.output = root.path().join("parallel");
+    let parallel = run_with_pool(&request, &cancelled, |_, _| {}, || Ok(()), Some(&pool))?;
+    assert_eq!(parallel, serial);
+    assert!(parallel.contains(&0) && parallel.contains(&3));
+    let files = |root: &Path| -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
+                Err(err) => Some(Err(err)),
+                _ => None,
+            })
+            .map(|path| {
+                let path = path?;
+                Ok((path.strip_prefix(root)?.to_owned(), fs::read(path)?))
+            })
+            .collect()
+    };
+    assert_eq!(files(&serial_output)?, files(&request.output)?);
+
+    request.output = root.path().join("cancelled");
+    let result = run_with_pool(
+        &request,
+        &cancelled,
+        |stage, fraction| {
+            if stage == "生成地图切片" && fraction == Some(0.0) {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+        || panic!("取消后仍尝试发布"),
+        Some(&pool),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("已取消"));
+    assert!(!request.output.exists());
+    Ok(())
+}

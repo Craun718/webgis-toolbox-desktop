@@ -265,6 +265,7 @@ fn converts_stripped_rgba_with_odd_dimensions_and_preserves_hidden_samples() -> 
 #[test]
 fn converts_toolbox_dom_and_dsm_with_internal_mask_and_nodata() -> Result<()> {
     let root = tempfile::tempdir()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
     for (name, kind, flags) in [
         ("dom.tif", RasterKind::Dom, &[0, 4, 1, 1, 5, 5][..]),
         ("dsm.tif", RasterKind::Dsm, &[0, 1, 1][..]),
@@ -272,6 +273,16 @@ fn converts_toolbox_dom_and_dsm_with_internal_mask_and_nodata() -> Result<()> {
         let input = root.path().join(name);
         dom_dsm(&input, kind)?;
         let output = convert(&input)?;
+        let parallel = root.path().join(format!("parallel-{name}"));
+        run_with_pool(
+            &input,
+            &parallel,
+            &AtomicBool::new(false),
+            |_| {},
+            || Ok(()),
+            Some(&pool),
+        )?;
+        assert_eq!(fs::read(&parallel)?, fs::read(&output)?);
         compare_full_resolution(&input, &output)?;
         check_layout(&output, SIZE, flags)?;
         if kind == RasterKind::Dom {
@@ -346,7 +357,8 @@ fn rejects_unsupported_inputs_and_cleans_up_cancelled_or_conflicting_output() ->
     let cancelled = root.path().join("cancelled.tif");
     let files = || fs::read_dir(root.path()).unwrap().count();
     let before = files();
-    let error = run(
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let error = run_with_pool(
         &input,
         &cancelled,
         &cancel,
@@ -356,6 +368,7 @@ fn rejects_unsupported_inputs_and_cleans_up_cancelled_or_conflicting_output() ->
             }
         },
         || panic!("取消后进入发布"),
+        Some(&pool),
     )
     .unwrap_err();
     assert!(error.to_string().contains("取消"));

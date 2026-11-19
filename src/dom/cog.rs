@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
+use webgis_core::task_pool::ThreadPool;
 
 pub fn default_output(source: &Path) -> PathBuf {
     let mut name = source.file_stem().unwrap_or_default().to_os_string();
@@ -23,6 +24,17 @@ pub fn run(
     cancelled: &AtomicBool,
     progress: impl Fn(Progress),
     before_publish: impl FnOnce() -> Result<()>,
+) -> Result<PathBuf> {
+    run_with_pool(input, output, cancelled, progress, before_publish, None)
+}
+
+pub fn run_with_pool(
+    input: &Path,
+    output: &Path,
+    cancelled: &AtomicBool,
+    progress: impl Fn(Progress),
+    before_publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
 ) -> Result<PathBuf> {
     check_cancelled(cancelled)?;
     ensure!(
@@ -60,6 +72,7 @@ pub fn run(
         &mut source,
         cancelled,
         progress,
+        pool,
     )?;
     check_cancelled(cancelled)?;
     before_publish()?;

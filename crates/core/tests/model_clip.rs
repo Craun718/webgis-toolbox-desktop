@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
-use webgis_core::model_clip::{Reference, Request, osgb, preflight, run};
+use webgis_core::model_clip::{Reference, Request, osgb, preflight, run, run_with_pool};
 
 const WGS84_ESRI: &str = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["Degree",0.0174532925199433]]"#;
 
@@ -318,31 +318,87 @@ fn preserves_relative_paging_and_reports_missing_tiles() {
     lod.extend([1, 0]); // DatabasePath present, empty
     lod.extend(0u32.to_le_bytes());
     lod.extend([0, 1]); // DisableExternalChildrenPaging, RangeDataList
-    let name = b"tiles\\child.osgb";
-    lod.extend(1u32.to_le_bytes());
-    lod.extend(((name.len() + 8) as u32).to_le_bytes());
-    lod.extend((name.len() as u32).to_le_bytes());
-    lod.extend(name);
-    lod.extend(1u32.to_le_bytes());
-    lod.extend(12u32.to_le_bytes());
-    lod.extend(0f32.to_le_bytes());
-    lod.extend(1f32.to_le_bytes());
+    let names = [b"tiles\\child.osgb", b"tiles\\other.osgb"];
+    lod.extend(2u32.to_le_bytes());
+    lod.extend((4 + names.iter().map(|name| 4 + name.len() as u32).sum::<u32>()).to_le_bytes());
+    for name in names {
+        lod.extend((name.len() as u32).to_le_bytes());
+        lod.extend(name);
+    }
+    lod.extend(2u32.to_le_bytes());
+    lod.extend(20u32.to_le_bytes());
+    for _ in names {
+        lod.extend(0f32.to_le_bytes());
+        lod.extend(1f32.to_le_bytes());
+    }
     lod.push(0); // Children
     let mut scene = input[..25].to_vec();
     scene.extend(object("osg::PagedLOD", 4, lod));
     fs::write(model.join("Block.osgb"), scene).unwrap();
     request.model = model;
     assert!(preflight(&request).err().unwrap().contains("child.osgb"));
-    fs::write(&tile, input).unwrap();
-    let report = run(&request, &AtomicBool::new(false), |_| {}, || Ok(())).unwrap();
-    assert_eq!(report.files, 2);
+    let textured = triangle_scene_with_texture(Some("albedo.ppm"));
+    fs::write(&tile, &textured).unwrap();
+    fs::write(tile.with_file_name("other.osgb"), textured).unwrap();
+    fs::write(
+        tile.with_file_name("albedo.ppm"),
+        b"P6\n1 1\n255\n\xff\x80\x00",
+    )
+    .unwrap();
+    let cancelled = AtomicBool::new(false);
+    let report = run(&request, &cancelled, |_| {}, || Ok(())).unwrap();
+    assert_eq!(report.files, 3);
     assert_unit_square(&fs::read(report.output.join("tiles/child.osgb")).unwrap());
     let entry = fs::read(&report.entries[0]).unwrap();
     assert!(
         entry
-            .windows(name.len())
+            .windows(names[0].len())
             .any(|bytes| bytes == b"tiles/child.osgb")
     );
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    request.output = temp.path().join("parallel");
+    let parallel = run_with_pool(&request, &cancelled, |_| {}, || Ok(()), Some(&pool)).unwrap();
+    assert_eq!(
+        (parallel.files, parallel.triangles),
+        (report.files, report.triangles)
+    );
+    for path in [
+        "Block.osgb",
+        "metadata.xml",
+        "tiles/child.osgb",
+        "tiles/other.osgb",
+        "tiles/albedo.ppm",
+    ] {
+        assert_eq!(
+            fs::read(parallel.output.join(path)).unwrap(),
+            fs::read(report.output.join(path)).unwrap()
+        );
+    }
+    assert_eq!(
+        fs::read_dir(parallel.output.join("tiles")).unwrap().count(),
+        3
+    );
+
+    request.output = temp.path().join("cancelled");
+    let error = run_with_pool(
+        &request,
+        &cancelled,
+        |progress| {
+            if progress.completed == 1 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        },
+        || panic!("取消后仍尝试发布"),
+        Some(&pool),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("已取消"));
+    assert!(!request.output.exists());
 }
 
 fn node_fields() -> Vec<u8> {

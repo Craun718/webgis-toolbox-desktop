@@ -4,6 +4,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
+use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
@@ -69,6 +70,25 @@ pub fn parse_zooms(value: &str) -> Result<BTreeSet<u8>> {
 }
 
 pub fn run(level: &Level, options: &Options, output: &Path) -> Result<()> {
+    run_with_pool(level, options, output, None)
+}
+
+pub fn run_with_pool(
+    level: &Level,
+    options: &Options,
+    output: &Path,
+    pool: Option<&ThreadPool>,
+) -> Result<()> {
+    run_with_publish(level, options, output, pool, || Ok(()))
+}
+
+pub fn run_with_publish(
+    level: &Level,
+    options: &Options,
+    output: &Path,
+    pool: Option<&ThreadPool>,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let path = |root: &Path, zoom: u8, (x, y)| {
         root.join(relative_path(
             zoom,
@@ -94,21 +114,27 @@ pub fn run(level: &Level, options: &Options, output: &Path) -> Result<()> {
             }
         }
 
-        let mut source = Source::new(level, size.unwrap(), options.source_zoom);
+        let workers = task_pool::width(pool);
+        let mut sources: Vec<_> = (0..workers)
+            .map(|_| Source::new(level, size.unwrap(), options.source_zoom, workers))
+            .collect();
         for &zoom in &options.zooms {
             let delta = i32::from(zoom) - i32::from(options.source_zoom);
             let factor = 1_u32 << delta.unsigned_abs();
-            let mut render = |coord, scale, method, children: &[Coord]| -> Result<()> {
-                let image = if method == Resampling::Average && delta < 0 {
-                    area_average(&mut source, coord, factor, children)?
-                } else {
-                    sample_tile(&mut source, coord, scale, method)?
+            let render =
+                |(coord, scale, method, children): (Coord, f64, Resampling, Vec<Coord>),
+                 source: &mut Source<'_>|
+                 -> Result<()> {
+                    let image = if method == Resampling::Average && delta < 0 {
+                        area_average(source, coord, factor, &children)?
+                    } else {
+                        sample_tile(source, coord, scale, method)?
+                    };
+                    if image.pixels().any(|pixel| pixel[3] != 0) {
+                        encode(&path(root, zoom, coord), &image, options)?;
+                    }
+                    Ok(())
                 };
-                if image.pixels().any(|pixel| pixel[3] != 0) {
-                    encode(&path(root, zoom, coord), &image, options)?;
-                }
-                Ok(())
-            };
             if delta < 0 {
                 let mut groups = BTreeMap::<Coord, Vec<Coord>>::new();
                 for &(x, y) in level.keys() {
@@ -117,30 +143,32 @@ pub fn run(level: &Level, options: &Options, output: &Path) -> Result<()> {
                         .or_default()
                         .push((x, y));
                 }
-                for (parent, children) in groups {
-                    render(
+                let jobs = groups.into_iter().map(|(parent, children)| {
+                    (
                         parent,
                         f64::from(factor),
                         options.resampling.unwrap_or(Resampling::Average),
-                        &children,
-                    )?;
+                        children,
+                    )
+                });
+                for batch in task_pool::batches(jobs, pool) {
+                    task_pool::map_with(pool, batch, &mut sources, render)?;
                 }
             } else if delta > 0 {
-                for &(x, y) in level.keys() {
-                    for row in y * factor..(y + 1) * factor {
-                        for col in x * factor..(x + 1) * factor {
-                            render(
-                                (col, row),
-                                1.0 / f64::from(factor),
-                                options.resampling.unwrap_or(Resampling::Bilinear),
-                                &[],
-                            )?;
-                        }
-                    }
+                let method = options.resampling.unwrap_or(Resampling::Bilinear);
+                let scale = 1.0 / f64::from(factor);
+                let jobs = level.keys().flat_map(|&(x, y)| {
+                    (y * factor..(y + 1) * factor).flat_map(move |row| {
+                        (x * factor..(x + 1) * factor)
+                            .map(move |col| ((col, row), scale, method, Vec::new()))
+                    })
+                });
+                for batch in task_pool::batches(jobs, pool) {
+                    task_pool::map_with(pool, batch, &mut sources, render)?;
                 }
             }
         }
-        Ok(())
+        before_publish()
     })
 }
 
@@ -194,12 +222,13 @@ struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    fn new(level: &'a Level, size: u32, zoom: u8) -> Self {
+    fn new(level: &'a Level, size: u32, zoom: u8, workers: usize) -> Self {
         Self {
             level,
             size,
             world_pixels: i64::from(size) << zoom,
-            capacity: (256 * 1024 * 1024 / (size as usize * size as usize * 4)).min(64),
+            capacity: (256 * 1024 * 1024 / workers / (size as usize * size as usize * 4))
+                .clamp(1, 64),
             cache: HashMap::new(),
             order: VecDeque::new(),
         }

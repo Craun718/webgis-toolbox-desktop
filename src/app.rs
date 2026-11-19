@@ -1,20 +1,21 @@
-use anyhow::{Context, Result, anyhow, ensure};
+mod settings;
+mod task;
+
+use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, Context as EguiContext, RichText, Ui};
+use settings::Settings;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
 };
+use task::{TaskContext, TaskWindow, Worker};
 use tiles_toolbox::{
     mosaic,
     pyramid::{self, Resampling},
     stacta,
     tiles::{Format, Index, Scheme},
 };
-use webgis_core::model_clip as clip;
+use webgis_core::{model_clip as clip, task_pool::ThreadPool};
 use webgis_toolbox::dom;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,9 +45,12 @@ pub struct App {
     tiles: [TileForm; TileOp::ALL.len()],
     clip: ClipForm,
     worker: Option<Worker>,
+    task_window: Option<TaskWindow>,
+    task_sequence: u64,
     show_close_notice: bool,
     outcome: Option<Result<Outcome>>,
     font_loaded: bool,
+    settings: Settings,
 }
 
 enum Outcome {
@@ -63,99 +67,6 @@ enum Outcome {
     },
 }
 
-#[derive(Clone)]
-struct Stage {
-    name: String,
-    fraction: Option<f32>,
-    publishing: bool,
-}
-
-struct TaskContext {
-    egui: EguiContext,
-    cancelled: Arc<AtomicBool>,
-    stage: Arc<Mutex<Stage>>,
-}
-
-impl TaskContext {
-    fn update(&self, name: impl Into<String>, fraction: Option<f32>) {
-        *self.stage.lock().unwrap() = Stage {
-            name: name.into(),
-            fraction,
-            publishing: false,
-        };
-        self.egui.request_repaint();
-    }
-
-    fn publish(&self) -> Result<()> {
-        let mut stage = self.stage.lock().unwrap();
-        ensure!(!self.cancelled.load(Ordering::Relaxed), "处理已取消");
-        *stage = Stage {
-            name: "发布结果".into(),
-            fraction: None,
-            publishing: true,
-        };
-        self.egui.request_repaint();
-        Ok(())
-    }
-}
-
-struct Worker {
-    cancelled: Arc<AtomicBool>,
-    cancellable: bool,
-    stage: Arc<Mutex<Stage>>,
-    receiver: mpsc::Receiver<Result<Outcome>>,
-}
-
-impl Worker {
-    fn close_notice(&self) -> &'static str {
-        let stage = self.stage.lock().unwrap();
-        if self.cancelled.load(Ordering::Relaxed) {
-            "请等待任务取消完成后再关闭窗口。"
-        } else if self.cancellable && !stage.publishing {
-            "请先点击主界面的『取消任务』，等待任务停止后再关闭窗口。"
-        } else {
-            "请等待当前任务结束后再关闭窗口。"
-        }
-    }
-
-    fn start(
-        egui: &EguiContext,
-        cancellable: bool,
-        work: impl FnOnce(&TaskContext) -> Result<Outcome> + Send + 'static,
-    ) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let stage = Arc::new(Mutex::new(Stage {
-            name: "准备任务".into(),
-            fraction: None,
-            publishing: false,
-        }));
-        let task = TaskContext {
-            egui: egui.clone(),
-            cancelled: cancelled.clone(),
-            stage: stage.clone(),
-        };
-        std::thread::Builder::new()
-            .name("webgis-task".into())
-            .spawn(move || {
-                let result = work(&task);
-                let result = if result.is_err() && task.cancelled.load(Ordering::Relaxed) {
-                    Ok(Outcome::Cancelled)
-                } else {
-                    result
-                };
-                let _ = sender.send(result);
-                task.egui.request_repaint();
-            })?;
-        Ok(Self {
-            cancelled,
-            cancellable,
-            stage,
-            receiver,
-        })
-    }
-}
-
 impl App {
     pub fn new(ctx: &EguiContext) -> Self {
         ctx.all_styles_mut(|style| style.spacing.button_padding += egui::vec2(4.0, 4.0));
@@ -169,9 +80,12 @@ impl App {
             tiles: Default::default(),
             clip: ClipForm::default(),
             worker: None,
+            task_window: None,
+            task_sequence: 0,
             show_close_notice: false,
             outcome: None,
             font_loaded: install_font(ctx),
+            settings: Settings::new(ctx),
         }
     }
 
@@ -192,7 +106,11 @@ impl App {
             let result = match worker.receiver.try_recv() {
                 Ok(result) => result,
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!("后台处理线程异常退出")),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let result = Err(anyhow!("后台处理线程异常退出"));
+                    worker.finish_disconnected(&result);
+                    result
+                }
             };
             if let Ok(Outcome::Layers { path, layers }) = &result
                 && path == Path::new(self.clip.boundary.trim())
@@ -207,10 +125,17 @@ impl App {
 
     fn start(&mut self, ctx: &EguiContext, action: Action) -> Result<()> {
         self.outcome = None;
-        self.worker = Some(match (self.selected, action) {
+        let operation = match action {
+            Action::Layers => "扫描 ZIP 图层",
+            Action::Preview => "预检",
+            Action::Run => "处理",
+        };
+        let name = format!("{} · {operation}", self.selected.name());
+        let threads = self.settings.threads();
+        let worker = match (self.selected, action) {
             (Tool::Raster, Action::Preview | Action::Run) => {
                 let request = self.raster.request()?;
-                Worker::start(ctx, true, move |task| {
+                Worker::start(ctx, &name, true, move |task| {
                     let update = |event: dom::Progress| task.update(event.stage, event.fraction);
                     if action == Action::Preview {
                         Ok(Outcome::RasterPreview(dom::preflight(
@@ -219,8 +144,15 @@ impl App {
                             update,
                         )?))
                     } else {
+                        let pool = processing_pool(threads)?;
                         Ok(Outcome::Artifacts {
-                            paths: dom::run(&request, &task.cancelled, update, || task.publish())?,
+                            paths: dom::run_with_pool(
+                                &request,
+                                &task.cancelled,
+                                update,
+                                || task.publish(),
+                                pool.as_ref(),
+                            )?,
                             details: None,
                         })
                     }
@@ -229,13 +161,15 @@ impl App {
             (Tool::Cog, Action::Run) => {
                 let input = required_path("源 GeoTIFF", &self.cog.input)?;
                 let output = required_path("输出 COG", &self.cog.output)?;
-                Worker::start(ctx, true, move |task| {
-                    let output = dom::cog::run(
+                Worker::start(ctx, &name, true, move |task| {
+                    let pool = processing_pool(threads)?;
+                    let output = dom::cog::run_with_pool(
                         &input,
                         &output,
                         &task.cancelled,
                         |event| task.update(event.stage, event.fraction),
                         || task.publish(),
+                        pool.as_ref(),
                     )?;
                     Ok(Outcome::Artifacts {
                         paths: vec![output],
@@ -245,7 +179,7 @@ impl App {
             }
             (Tool::Clip, Action::Layers) => {
                 let path = required_path("裁剪范围", &self.clip.boundary)?;
-                Worker::start(ctx, false, move |task| {
+                Worker::start(ctx, &name, false, move |task| {
                     task.update("扫描 ZIP 图层", None);
                     let layers = clip::zip_layers(&path).map_err(|e| anyhow!(e))?;
                     Ok(Outcome::Layers { path, layers })
@@ -253,14 +187,15 @@ impl App {
             }
             (Tool::Clip, Action::Preview | Action::Run) => {
                 let request = self.clip.request()?;
-                Worker::start(ctx, true, move |task| {
+                Worker::start(ctx, &name, true, move |task| {
                     task.update("预检模型、裁剪范围与输出", None);
                     if action == Action::Preview {
                         return clip::preflight_cancelable(&request, &task.cancelled)
                             .map(Outcome::ClipPreview)
                             .map_err(|e| anyhow!(e));
                     }
-                    let result = clip::run(
+                    let pool = processing_pool(threads)?;
+                    let result = clip::run_with_pool(
                         &request,
                         &task.cancelled,
                         |p| {
@@ -270,6 +205,7 @@ impl App {
                             );
                         },
                         || task.publish().map_err(|err| err.to_string()),
+                        pool.as_ref(),
                     )
                     .map_err(|e| anyhow!(e))?;
                     let details = format!(
@@ -286,12 +222,16 @@ impl App {
             }
             (Tool::Tiles(operation), Action::Run) => {
                 let form = self.tiles[operation as usize].clone();
-                Worker::start(ctx, operation == TileOp::MapTiles, move |task| {
-                    form.run(operation, task)
+                Worker::start(ctx, &name, operation == TileOp::MapTiles, move |task| {
+                    let pool = processing_pool(threads)?;
+                    form.run(operation, task, pool.as_ref())
                 })?
             }
             _ => unreachable!(),
-        });
+        };
+        self.task_sequence += 1;
+        self.task_window = Some(worker.window(self.task_sequence));
+        self.worker = Some(worker);
         Ok(())
     }
 }
@@ -345,6 +285,10 @@ impl eframe::App for App {
                 }
                 ui.add_space(14.);
                 if self.selected == Tool::Settings {
+                    self.settings.ui(ui);
+                    ui.add_space(18.);
+                    ui.separator();
+                    ui.add_space(10.);
                     ui.heading("关于");
                     ui.add_space(8.);
                     egui::Grid::new("about_project").show(ui, |ui| {
@@ -388,34 +332,7 @@ impl eframe::App for App {
                     });
                 });
                 if let Some(worker) = &self.worker {
-                    ui.add_space(10.);
-                    ui.separator();
-                    let stage = worker.stage.lock().unwrap().clone();
-                    ui.label(stage.name);
-                    if let Some(value) = stage.fraction {
-                        ui.add(egui::ProgressBar::new(value).show_percentage());
-                    } else {
-                        ui.spinner();
-                    }
-                    if worker.cancellable && !stage.publishing {
-                        let pending = worker.cancelled.load(Ordering::Relaxed);
-                        if ui
-                            .add_enabled(
-                                !pending,
-                                egui::Button::new(if pending {
-                                    "正在取消"
-                                } else {
-                                    "取消任务"
-                                }),
-                            )
-                            .clicked()
-                        {
-                            let stage = worker.stage.lock().unwrap();
-                            if !stage.publishing {
-                                worker.cancelled.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                    worker.show_cancel_button(ui);
                 }
                 if let Some(outcome) = &self.outcome {
                     ui.add_space(12.);
@@ -428,6 +345,12 @@ impl eframe::App for App {
             && let Err(err) = self.start(ctx, action)
         {
             self.outcome = Some(Err(err));
+        }
+        if let Some(window) = &self.task_window
+            && window.show(ctx, self.worker.is_some())
+        {
+            self.task_window = None;
+            ctx.request_repaint();
         }
         if let Some(worker) = &self.worker {
             if self.show_close_notice {
@@ -445,6 +368,17 @@ impl eframe::App for App {
             self.show_close_notice = false;
         }
     }
+}
+
+fn processing_pool(threads: usize) -> Result<Option<ThreadPool>> {
+    if threads == 1 {
+        return Ok(None);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map(Some)
+        .context("无法创建任务线程池")
 }
 
 fn install_font(ctx: &EguiContext) -> bool {
@@ -1136,7 +1070,12 @@ impl TileForm {
         }
     }
 
-    fn run(self, operation: TileOp, task: &TaskContext) -> Result<Outcome> {
+    fn run(
+        self,
+        operation: TileOp,
+        task: &TaskContext,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Outcome> {
         let input = required_path(
             if operation == TileOp::MapTiles {
                 "GeoTIFF"
@@ -1158,7 +1097,13 @@ impl TileForm {
                 let output = required_path("GeoTIFF 输出文件", &self.output)?;
                 let index = Index::scan(&input, self.scheme)?;
                 task.update("拼接 GeoTIFF", None);
-                mosaic::run(index.level(self.zoom)?, self.zoom, &output)?;
+                mosaic::run_with_publish(
+                    index.level(self.zoom)?,
+                    self.zoom,
+                    &output,
+                    pool,
+                    || task.publish(),
+                )?;
                 output
             }
             TileOp::Pyramid => {
@@ -1177,7 +1122,13 @@ impl TileForm {
                 };
                 let index = Index::scan(&input, self.scheme)?;
                 task.update("生成多级瓦片", None);
-                pyramid::run(index.level(self.zoom)?, &options, &output)?;
+                pyramid::run_with_publish(
+                    index.level(self.zoom)?,
+                    &options,
+                    &output,
+                    pool,
+                    || task.publish(),
+                )?;
                 output
             }
             TileOp::Stacta => {
@@ -1189,12 +1140,14 @@ impl TileForm {
                 let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
                     .context("时间须符合 RFC 3339")?;
                 task.update("校验瓦片并生成 STACTA", None);
-                stacta::run(
+                stacta::run_with_publish(
                     &input,
                     self.scheme,
                     export.as_deref(),
                     datetime,
                     optional_text(&self.id),
+                    pool,
+                    || task.publish(),
                 )?;
                 export.unwrap_or(input).join("stacta.json")
             }
@@ -1210,11 +1163,12 @@ impl TileForm {
                     datetime,
                     id: optional_text(&self.id),
                 };
-                let levels = dom::map_tiles::run(
+                let levels = dom::map_tiles::run_with_pool(
                     &request,
                     &task.cancelled,
                     |stage, fraction| task.update(stage, fraction),
                     || task.publish(),
+                    pool,
                 )?;
                 let missing: Vec<_> = (self.min_zoom..=self.max_zoom)
                     .filter(|z| !levels.contains(z))

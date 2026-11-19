@@ -1,3 +1,4 @@
+use webgis_core::task_pool::{self, ThreadPool};
 pub mod cog;
 mod geotiff;
 pub mod map_tiles;
@@ -304,8 +305,18 @@ pub fn preflight(
 pub fn run(
     request: &Request,
     cancelled: &AtomicBool,
+    progress: impl FnMut(Progress),
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    run_with_pool(request, cancelled, progress, before_publish, None)
+}
+
+pub fn run_with_pool(
+    request: &Request,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress),
     before_publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
 ) -> Result<Vec<PathBuf>> {
     let (summary, mesh, crs) = prepare(request, cancelled, &mut progress)?;
     check_cancelled(cancelled)?;
@@ -335,28 +346,30 @@ pub fn run(
     let mut dsm = LevelWriter::new(&mut dsm_file, RasterKind::Dsm)?;
     let mut dom = LevelWriter::new(&mut dom_file, RasterKind::Dom)?;
     let index = raster::index(&mesh.triangles);
-    let mut textures = TextureCache::new(&mesh.images);
+    let mut textures: Vec<_> = (0..task_pool::width(pool))
+        .map(|_| TextureCache::new(&mesh.images))
+        .collect();
     let (w, h) = (width as usize, height as usize);
     let count = w.div_ceil(TILE) as u64 * h.div_ceil(TILE) as u64;
     let mut done = 0_u64;
     let mut dsm_valid_pixels = 0_u64;
     let mut dom_valid_pixels = 0_u64;
-    for y in (0..h).step_by(TILE) {
-        for x in (0..w).step_by(TILE) {
+    let positions = (0..h)
+        .step_by(TILE)
+        .flat_map(|y| (0..w).step_by(TILE).map(move |x| (x, y)));
+    for batch in task_pool::batches(positions, pool) {
+        let blocks = task_pool::map_with(pool, batch, &mut textures, |(x, y), textures| {
             check_cancelled(cancelled)?;
             let rect = [x, y, TILE.min(w - x), TILE.min(h - y)];
-            let block = raster::render(
-                &mesh.triangles,
-                &index,
-                &mut textures,
-                &summary,
-                rect,
-                cancelled,
-            )?;
+            let block =
+                raster::render(&mesh.triangles, &index, textures, &summary, rect, cancelled)?;
+            Ok::<_, anyhow::Error>(([rect[2], rect[3]], block))
+        })?;
+        for (size, block) in blocks {
+            check_cancelled(cancelled)?;
             let (z, color) = block.into_planes();
             dsm_valid_pixels += z.iter().filter(|&&v| v != NODATA).count() as u64;
             dom_valid_pixels += color[3].iter().filter(|&&v| v != 0).count() as u64;
-            let size = [rect[2], rect[3]];
             dsm.height(size, &z)?;
             dom.color(size, &color)?;
             done += 1;

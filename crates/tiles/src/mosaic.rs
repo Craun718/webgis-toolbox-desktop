@@ -1,4 +1,5 @@
 use std::{fs::File, path::Path};
+use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result};
 use tiff_core::{Compression, ExtraSample, PhotometricInterpretation, Tag, TagValue};
@@ -7,10 +8,32 @@ use tiff_writer::{ImageBuilder, TiffWriter, WriteOptions};
 use crate::tiles::{Bounds, HALF_WORLD, Level, publish_file, tile_span};
 
 pub fn run(level: &Level, zoom: u8, output: &Path) -> Result<()> {
-    publish_file(output, |file| write(file, level, zoom))
+    run_with_pool(level, zoom, output, None)
 }
 
-fn write(file: &mut File, level: &Level, zoom: u8) -> Result<()> {
+pub fn run_with_pool(
+    level: &Level,
+    zoom: u8,
+    output: &Path,
+    pool: Option<&ThreadPool>,
+) -> Result<()> {
+    run_with_publish(level, zoom, output, pool, || Ok(()))
+}
+
+pub fn run_with_publish(
+    level: &Level,
+    zoom: u8,
+    output: &Path,
+    pool: Option<&ThreadPool>,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    publish_file(output, |file| {
+        write(file, level, zoom, pool)?;
+        before_publish()
+    })
+}
+
+fn write(file: &mut File, level: &Level, zoom: u8, pool: Option<&ThreadPool>) -> Result<()> {
     let (&first_coord, first_tile) = level.first_key_value().unwrap();
     let first = first_tile.decode(None)?.image.into_rgba8();
     let size = first.width();
@@ -48,17 +71,30 @@ fn write(file: &mut File, level: &Level, zoom: u8) -> Result<()> {
     let mut writer = TiffWriter::new(file, WriteOptions::auto())?;
     let handle = writer.add_image(image)?;
     let blank = vec![0_u8; (size * size * 4) as usize];
-    for y in bounds.min_y..=bounds.max_y {
-        for x in bounds.min_x..=bounds.max_x {
+    let coords = (bounds.min_y..=bounds.max_y)
+        .flat_map(|y| (bounds.min_x..=bounds.max_x).map(move |x| (x, y)));
+    let mut first = Some(first);
+    for batch in task_pool::batches(coords, pool) {
+        let decoded = task_pool::map(pool, batch, |coord| {
+            let image = level
+                .get(&coord)
+                .filter(|_| coord != first_coord)
+                .map(|tile| tile.rgba(size))
+                .transpose()?;
+            Ok::<_, anyhow::Error>((coord, image))
+        })?;
+        for ((x, y), image) in decoded {
             let block = (y - bounds.min_y) as usize * cols as usize + (x - bounds.min_x) as usize;
-            let coord = (x, y);
-            if coord == first_coord {
-                writer.write_block(&handle, block, first.as_raw())?;
-            } else if let Some(tile) = level.get(&coord) {
-                writer.write_block(&handle, block, tile.rgba(size)?.as_raw())?;
+            let image = if (x, y) == first_coord {
+                first.take()
             } else {
-                writer.write_block(&handle, block, &blank)?;
-            }
+                image
+            };
+            writer.write_block(
+                &handle,
+                block,
+                image.as_ref().map_or(&blank, |image| image.as_raw()),
+            )?;
         }
     }
     writer.finish()?;
@@ -86,7 +122,7 @@ mod tests {
         publish_file(&output, |file| {
             // 扩展稀疏文件，让真实 IFD 位置跨过 32 位偏移，无需分配 4 GiB 像素。
             file.set_len(1_u64 << 32)?;
-            write(file, index.level(0)?, 0)
+            write(file, index.level(0)?, 0, None)
         })
         .unwrap();
 

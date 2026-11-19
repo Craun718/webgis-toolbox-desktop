@@ -7,6 +7,7 @@ use tiles_toolbox::{
     stacta,
     tiles::{Bounds, HALF_WORLD, publish_directory, relative_path, tile_span},
 };
+use webgis_core::task_pool::{self, ThreadPool};
 
 pub const MAX_ZOOM: u8 = 23;
 
@@ -22,8 +23,18 @@ pub struct Request {
 pub fn run(
     request: &Request,
     cancelled: &AtomicBool,
+    progress: impl FnMut(String, Option<f32>),
+    publish: impl FnOnce() -> Result<()>,
+) -> Result<Vec<u8>> {
+    run_with_pool(request, cancelled, progress, publish, None)
+}
+
+pub fn run_with_pool(
+    request: &Request,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(String, Option<f32>),
     publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
 ) -> Result<Vec<u8>> {
     ensure!(
         request.min_zoom <= request.max_zoom,
@@ -38,7 +49,7 @@ pub fn run(
         "请选择 .tif 或 .tiff 文件"
     );
     check_cancelled(cancelled)?;
-    let mut source = Source::open(&request.input)
+    let source = Source::open(&request.input)
         .with_context(|| format!("读取 {} 失败", request.input.display()))?;
     let grid = Grid::new(&source)?;
     let bounds = grid
@@ -64,44 +75,61 @@ pub fn run(
     let mut levels = Vec::new();
     publish_directory(&request.output, |staging| {
         let mut visited = 0_u64;
-        let mut rgba = RgbaImage::new(TILE as u32, TILE as u32);
+        let mut readers: Vec<_> = (0..task_pool::width(pool)).map(|_| None).collect();
+        let buffer = || RgbaImage::new(TILE as u32, TILE as u32);
+        readers[0] = Some((source, grid, buffer()));
         progress("生成地图切片".into(), Some(0.0));
         for (zoom, candidates) in zoom_ranges {
             let span = tile_span(zoom);
             let pixel = span / TILE as f64;
             let mut coverage: Option<Bounds> = None;
-            for (x, y) in candidates.into_iter().flat_map(|bounds| {
+            let coordinates = candidates.into_iter().flat_map(|bounds| {
                 (bounds.min_y..=bounds.max_y)
                     .flat_map(move |y| (bounds.min_x..=bounds.max_x).map(move |x| (x, y)))
-            }) {
-                check_cancelled(cancelled)?;
-                let left = -HALF_WORLD + f64::from(x) * span;
-                let top = HALF_WORLD - f64::from(y) * span;
-                if grid
-                    .render(&mut source, &mut rgba, [left, top], pixel, cancelled)
-                    .with_context(|| {
-                        format!("采样 {} 的 {zoom}/{x}/{y} 失败", request.input.display())
-                    })?
-                {
-                    let path = staging.join(relative_path(zoom, x, y, "png"));
-                    tiles_toolbox::tiles::make_parent(&path)?;
-                    rgba.save(&path)
-                        .with_context(|| format!("写入瓦片 {}", path.display()))?;
-                    coverage
-                        .get_or_insert(Bounds {
-                            min_x: x,
-                            max_x: x,
-                            min_y: y,
-                            max_y: y,
-                        })
-                        .include(x, y);
-                }
-                visited += 1;
-                if visited.is_multiple_of(32) || visited == total {
-                    progress(
-                        format!("生成 {zoom} 级地图切片"),
-                        Some(visited as f32 / total as f32),
-                    );
+            });
+            for batch in task_pool::batches(coordinates, pool) {
+                let tiles = task_pool::map_with(pool, batch, &mut readers, |(x, y), reader| {
+                    check_cancelled(cancelled)?;
+                    if reader.is_none() {
+                        let source = Source::open(&request.input)
+                            .with_context(|| format!("读取 {} 失败", request.input.display()))?;
+                        let grid = Grid::new(&source)?;
+                        *reader = Some((source, grid, buffer()));
+                    }
+                    let (source, grid, rgba) = reader.as_mut().unwrap();
+                    let left = -HALF_WORLD + f64::from(x) * span;
+                    let top = HALF_WORLD - f64::from(y) * span;
+                    let valid = grid
+                        .render(source, rgba, [left, top], pixel, cancelled)
+                        .with_context(|| {
+                            format!("采样 {} 的 {zoom}/{x}/{y} 失败", request.input.display())
+                        })?;
+                    Ok::<_, anyhow::Error>((x, y, valid))
+                })?;
+                for ((x, y, valid), reader) in tiles.into_iter().zip(&readers) {
+                    check_cancelled(cancelled)?;
+                    if valid {
+                        let (_, _, rgba) = reader.as_ref().unwrap();
+                        let path = staging.join(relative_path(zoom, x, y, "png"));
+                        tiles_toolbox::tiles::make_parent(&path)?;
+                        rgba.save(&path)
+                            .with_context(|| format!("写入瓦片 {}", path.display()))?;
+                        coverage
+                            .get_or_insert(Bounds {
+                                min_x: x,
+                                max_x: x,
+                                min_y: y,
+                                max_y: y,
+                            })
+                            .include(x, y);
+                    }
+                    visited += 1;
+                    if visited.is_multiple_of(32) || visited == total {
+                        progress(
+                            format!("生成 {zoom} 级地图切片"),
+                            Some(visited as f32 / total as f32),
+                        );
+                    }
                 }
             }
             if let Some(coverage) = coverage {

@@ -3,6 +3,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
+use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, FixedOffset, SecondsFormat};
@@ -19,6 +20,29 @@ pub fn run(
     output: Option<&Path>,
     datetime: DateTime<FixedOffset>,
     id: Option<String>,
+) -> Result<()> {
+    run_with_pool(input, scheme, output, datetime, id, None)
+}
+
+pub fn run_with_pool(
+    input: &Path,
+    scheme: Scheme,
+    output: Option<&Path>,
+    datetime: DateTime<FixedOffset>,
+    id: Option<String>,
+    pool: Option<&ThreadPool>,
+) -> Result<()> {
+    run_with_publish(input, scheme, output, datetime, id, pool, || Ok(()))
+}
+
+pub fn run_with_publish(
+    input: &Path,
+    scheme: Scheme,
+    output: Option<&Path>,
+    datetime: DateTime<FixedOffset>,
+    id: Option<String>,
+    pool: Option<&ThreadPool>,
+    before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure!(
         (scheme == Scheme::Tms) == output.is_some(),
@@ -37,8 +61,14 @@ pub fn run(
     let index = Index::scan(input, scheme)?;
     let mut size = None;
     let mut layout = None;
-    for (&zoom, level) in &index.0 {
-        for (&(x, y), tile) in level {
+    let tiles = || {
+        index
+            .0
+            .iter()
+            .flat_map(|(&zoom, level)| level.iter().map(move |(&(x, y), tile)| (zoom, x, y, tile)))
+    };
+    for batch in task_pool::batches(tiles(), pool) {
+        let validated = task_pool::map(pool, batch, |(zoom, x, y, tile)| {
             if scheme == Scheme::Xyz {
                 ensure!(
                     tile.path == input.join(relative_path(zoom, x, y, tile.extension())),
@@ -47,7 +77,6 @@ pub fn run(
                 );
             }
             let decoded = tile.decode(size)?;
-            size = Some(decoded.image.width());
             let bands = decoded.bands.with_context(|| {
                 format!(
                     "STACTA 需要 8 位显式灰度、RGB 或 Alpha 波段：{}",
@@ -60,6 +89,18 @@ pub fn run(
                 tile.path.display()
             );
             let tile_layout = (tile.extension(), bands, tile.format);
+            Ok((tile, decoded.image.width(), tile_layout))
+        })?;
+        for (tile, width, tile_layout) in validated {
+            if let Some(size) = size {
+                ensure!(
+                    width == size,
+                    "读取切片 {}：切片边长应为 {size}，实际为 {width}",
+                    tile.path.display()
+                );
+            } else {
+                size = Some(width);
+            }
             if let Some((expected, ref first_path)) = layout {
                 ensure!(
                     expected == tile_layout,
@@ -75,33 +116,44 @@ pub fn run(
 
     let ((ext, bands, format), _) = layout.unwrap();
     let size = size.unwrap();
-    let write_index = |root: &Path| {
-        write_index(
-            root,
-            &id,
-            datetime,
-            size,
-            (ext, bands, format),
-            index
-                .0
-                .iter()
-                .map(|(&zoom, level)| (zoom, Bounds::of(level))),
-        )
+    let levels = || {
+        index
+            .0
+            .iter()
+            .map(|(&zoom, level)| (zoom, Bounds::of(level)))
     };
     if let Some(output) = output {
         publish_directory(output, |root| {
-            for (&zoom, level) in &index.0 {
-                for (&(x, y), tile) in level {
+            for batch in task_pool::batches(tiles(), pool) {
+                task_pool::map(pool, batch, |(zoom, x, y, tile)| {
                     let path = root.join(relative_path(zoom, x, y, ext));
                     make_parent(&path)?;
                     fs::copy(&tile.path, &path)
                         .with_context(|| format!("复制 {}", tile.path.display()))?;
-                }
+                    Ok::<_, anyhow::Error>(())
+                })?;
             }
-            write_index(root)
+            write_index(
+                root,
+                &id,
+                datetime,
+                size,
+                (ext, bands, format),
+                levels(),
+                || Ok(()),
+            )?;
+            before_publish()
         })
     } else {
-        write_index(input)
+        write_index(
+            input,
+            &id,
+            datetime,
+            size,
+            (ext, bands, format),
+            levels(),
+            before_publish,
+        )
     }
 }
 
@@ -114,7 +166,15 @@ pub fn write_rgba_png(
     size: u32,
     levels: impl IntoIterator<Item = (u8, Bounds)>,
 ) -> Result<()> {
-    write_index(root, id, datetime, size, ("png", 4, Format::Png), levels)
+    write_index(
+        root,
+        id,
+        datetime,
+        size,
+        ("png", 4, Format::Png),
+        levels,
+        || Ok(()),
+    )
 }
 
 /// 校验原点偏移和栅格尺寸能否由 32 位 STACTA 阅读器表示。
@@ -146,6 +206,7 @@ fn write_index(
     size: u32,
     (ext, bands, format): (&str, u8, Format),
     levels: impl IntoIterator<Item = (u8, Bounds)>,
+    before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure!(!id.trim().is_empty(), "--id 不能为空");
     ensure!(size > 0, "瓦片像元尺寸必须大于零");
@@ -258,6 +319,6 @@ fn write_index(
         serde_json::to_writer_pretty(&mut writer, &document)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        Ok(())
+        before_publish()
     })
 }
