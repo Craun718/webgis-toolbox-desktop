@@ -850,7 +850,7 @@ impl TileOp {
     fn name(self) -> &'static str {
         match self {
             Self::Mosaic => "拼接 GeoTIFF",
-            Self::Pyramid => "生成金字塔",
+            Self::Pyramid => "生成多级瓦片",
             Self::Stacta => "生成 STACTA",
             Self::MapTiles => "地图切片",
         }
@@ -960,7 +960,7 @@ impl TileForm {
                 }
                 path_field(
                     ui,
-                    "金字塔输出目录",
+                    "瓦片输出目录",
                     &mut self.output,
                     "新目录",
                     PathPicker::NewFolder,
@@ -1044,7 +1044,7 @@ impl TileForm {
                 output
             }
             TileOp::Pyramid => {
-                let output = required_path("金字塔输出目录", &self.output)?;
+                let output = required_path("瓦片输出目录", &self.output)?;
                 let options = pyramid::Options {
                     scheme: self.scheme,
                     source_zoom: self.zoom,
@@ -1058,7 +1058,7 @@ impl TileForm {
                     },
                 };
                 let index = Index::scan(&input, self.scheme)?;
-                task.update("生成切片金字塔", None);
+                task.update("生成多级瓦片", None);
                 pyramid::run(index.level(self.zoom)?, &options, &output)?;
                 output
             }
