@@ -44,6 +44,7 @@ pub struct App {
     tiles: [TileForm; TileOp::ALL.len()],
     clip: ClipForm,
     worker: Option<Worker>,
+    show_close_notice: bool,
     outcome: Option<Result<Outcome>>,
     font_loaded: bool,
 }
@@ -106,6 +107,17 @@ struct Worker {
 }
 
 impl Worker {
+    fn close_notice(&self) -> &'static str {
+        let stage = self.stage.lock().unwrap();
+        if self.cancelled.load(Ordering::Relaxed) {
+            "请等待任务取消完成后再关闭窗口。"
+        } else if self.cancellable && !stage.publishing {
+            "请先点击主界面的『取消任务』，等待任务停止后再关闭窗口。"
+        } else {
+            "请等待当前任务结束后再关闭窗口。"
+        }
+    }
+
     fn start(
         egui: &EguiContext,
         cancellable: bool,
@@ -157,6 +169,7 @@ impl App {
             tiles: Default::default(),
             clip: ClipForm::default(),
             worker: None,
+            show_close_notice: false,
             outcome: None,
             font_loaded: install_font(ctx),
         }
@@ -292,6 +305,7 @@ impl eframe::App for App {
         }
         if busy && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_close_notice = true;
         }
         egui::SidePanel::left("tools")
             .exact_width(212.)
@@ -414,6 +428,21 @@ impl eframe::App for App {
             && let Err(err) = self.start(ctx, action)
         {
             self.outcome = Some(Err(err));
+        }
+        if let Some(worker) = &self.worker {
+            if self.show_close_notice {
+                let response =
+                    egui::Modal::new(egui::Id::new("task_close_notice")).show(ctx, |ui| {
+                        ui.heading("任务正在进行");
+                        ui.label(worker.close_notice());
+                        ui.button("确定").clicked()
+                    });
+                if response.inner {
+                    self.show_close_notice = false;
+                }
+            }
+        } else {
+            self.show_close_notice = false;
         }
     }
 }
