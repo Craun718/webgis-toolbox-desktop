@@ -24,7 +24,7 @@ geo = { version = "0.33", default-features = false, features = ["spade"], option
 rstar = { version = "0.12", optional = true }
 serde_json = { version = "1", optional = true }
 shapefile = { version = "0.7", features = ["geo-types"], optional = true }
-zip = { version = "2.4", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9.7.3", default-features = false, features = ["deflate"], optional = true }
 quick-xml = { version = "0.41", optional = true }
 proj4rs = { version = "0.1.10", default-features = false, features = ["crs-definitions", "multi-thread"], optional = true }
 proj4wkt = { version = "0.1.1", optional = true }

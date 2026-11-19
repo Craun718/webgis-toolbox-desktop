@@ -11,12 +11,11 @@ use std::{
 const MAX_MEMBER: u64 = 256 * 1024 * 1024;
 
 pub fn zip_layers(path: &Path) -> Result<Vec<String>, String> {
-    let archive = open_zip(path)?;
-    let mut layers: Vec<_> = archive
-        .file_names()
-        .filter(|name| extension(Path::new(name)) == "shp")
-        .map(str::to_owned)
-        .collect();
+    shapefile_layers(&open_zip(path)?)
+}
+
+fn shapefile_layers(archive: &zip::ZipArchive<File>) -> Result<Vec<String>, String> {
+    let mut layers = matching_zip_names(archive, |name| extension(Path::new(name)) == "shp")?;
     layers.sort_unstable();
     Ok(layers)
 }
@@ -36,12 +35,7 @@ pub(super) fn read(
         }
         "zip" => {
             let mut archive = open_zip(path)?;
-            let mut layers: Vec<_> = archive
-                .file_names()
-                .filter(|name| extension(Path::new(name)) == "shp")
-                .map(str::to_owned)
-                .collect();
-            layers.sort_unstable();
+            let layers = shapefile_layers(&archive)?;
             let layer = match (layer.filter(|s| !s.is_empty()), layers.as_slice()) {
                 (None, [only]) => only,
                 (Some(layer), _) if layers.iter().any(|name| name == layer) => layer,
@@ -53,11 +47,9 @@ pub(super) fn read(
                 .with_extension("prj")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let prj_entries: Vec<_> = archive
-                .file_names()
-                .filter(|name| name.replace('\\', "/").eq_ignore_ascii_case(&prj_name))
-                .map(str::to_owned)
-                .collect();
+            let prj_entries = matching_zip_names(&archive, |name| {
+                name.replace('\\', "/").eq_ignore_ascii_case(&prj_name)
+            })?;
             let projection = match prj_entries.as_slice() {
                 [] => None,
                 [name] => Some(
@@ -116,6 +108,20 @@ fn read_sidecar(path: &Path) -> Result<Option<String>, String> {
 fn open_zip(path: &Path) -> Result<zip::ZipArchive<File>, String> {
     let stream = File::open(path).map_err(|err| err.to_string())?;
     zip::ZipArchive::new(stream).map_err(|err| format!("无法读取 ZIP：{err}"))
+}
+
+fn matching_zip_names(
+    archive: &zip::ZipArchive<File>,
+    matches: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for name in archive.file_names() {
+        let name = name.map_err(|err| format!("无法读取 ZIP 条目名称：{err}"))?;
+        if matches(&name) {
+            names.push(name.into_owned());
+        }
+    }
+    Ok(names)
 }
 
 fn zip_member(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {

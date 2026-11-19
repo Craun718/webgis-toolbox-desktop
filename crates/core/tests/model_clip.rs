@@ -46,10 +46,10 @@ fn clips_the_same_nonzero_origin_mesh_with_all_four_vector_formats() {
 
     let zip = root.join("range.zip");
     let mut archive = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     for name in ["layers/first.shp", "layers/second.shp"] {
-        archive
-            .start_file(name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        archive.start_file(name, options).unwrap();
         archive.write_all(&fs::read(&shp).unwrap()).unwrap();
     }
     archive.finish().unwrap();
