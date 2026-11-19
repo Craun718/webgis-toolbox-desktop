@@ -84,30 +84,26 @@ pub fn parse_origin(value: &str) -> Result<[f64; 3]> {
     Ok(origin)
 }
 
-fn scan(input: &Path, cancelled: &AtomicBool) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
-    let is_osgb = |path: &Path| {
-        path.extension()
-            .is_some_and(|v| v.eq_ignore_ascii_case("osgb"))
-    };
-    if input.is_file() {
-        ensure!(is_osgb(input), "请选择 OSGB 文件或目录");
-        return Ok((vec![input.to_owned()], None));
-    }
-    ensure!(input.is_dir(), "请选择 OSGB 文件或目录");
+pub fn is_metadata_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("metadata.xml"))
+}
+
+fn is_osgb(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("osgb"))
+}
+
+fn scan_osgb(directory: &Path, cancelled: &AtomicBool) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    let mut metadata = Vec::new();
-    for entry in WalkDir::new(input) {
+    for entry in WalkDir::new(directory) {
         check_cancelled(cancelled)?;
         let entry = entry?;
-        if entry.path().is_file() {
-            if is_osgb(entry.path()) {
-                files.push(entry.path().to_owned());
-            } else if entry.file_name() == "metadata.xml" {
-                metadata.push(entry.path().to_owned());
-            }
+        if entry.path().is_file() && is_osgb(entry.path()) {
+            files.push(entry.into_path());
         }
     }
-    ensure!(!files.is_empty(), "目录内没有 OSGB 文件");
+    ensure!(!files.is_empty(), "metadata.xml 所在目录内没有 OSGB 文件");
     let pattern = Regex::new(r"(?i)^(.+)_L(\d+)_(\d+)$")?;
     let mut groups = BTreeMap::<String, (u32, Vec<PathBuf>)>::new();
     for path in &files {
@@ -134,8 +130,7 @@ fn scan(input: &Path, cancelled: &AtomicBool) -> Result<(Vec<PathBuf>, Option<Pa
         files = groups.into_values().flat_map(|(_, parts)| parts).collect();
     }
     files.sort_by_cached_key(|path| (path.to_string_lossy().to_lowercase(), path.clone()));
-    metadata.sort();
-    Ok((files, metadata.into_iter().next()))
+    Ok(files)
 }
 
 fn metadata_values(path: &Path) -> Result<(Option<String>, Option<[f64; 3]>)> {
@@ -214,27 +209,26 @@ fn prepare(
         stage: "扫描 OSGB 与元数据".into(),
         fraction: None,
     });
+    let metadata_input = is_metadata_file(&request.input);
+    ensure!(
+        request.input.is_file() && (metadata_input || is_osgb(&request.input)),
+        "请选择根 OSGB 文件或 metadata.xml"
+    );
     let input = request
         .input
         .canonicalize()
         .with_context(|| request.input.display().to_string())?;
-    let (selected, nested) = scan(&input, cancelled)?;
-    let parent = input.parent();
-    let metadata = request.metadata.clone().or_else(|| {
-        let direct = input.is_dir().then(|| input.join("metadata.xml"));
-        direct
-            .into_iter()
-            .chain(parent.map(|p| p.join("metadata.xml")))
-            .chain(nested)
-            .chain(
-                parent
-                    .and_then(Path::parent)
-                    .into_iter()
-                    .flat_map(Path::ancestors)
-                    .map(|p| p.join("metadata.xml")),
-            )
-            .find(|path| path.is_file())
-    });
+    let root = input.parent().context("缺少输入父目录")?;
+    let (selected, metadata) = if metadata_input {
+        (scan_osgb(root, cancelled)?, Some(input.clone()))
+    } else {
+        let metadata = request.metadata.clone().or_else(|| {
+            root.ancestors()
+                .map(|directory| directory.join("metadata.xml"))
+                .find(|path| path.is_file())
+        });
+        (vec![input.clone()], metadata)
+    };
     let (metadata_crs, metadata_origin) = metadata
         .as_deref()
         .map(|path| metadata_values(path).with_context(|| path.display().to_string()))
@@ -268,11 +262,6 @@ fn prepare(
             };
             format!("{} 的坐标系无效", source.display())
         })?;
-    let root = if input.is_dir() {
-        input.as_path()
-    } else {
-        input.parent().context("缺少输入父目录")?
-    };
     let mesh = Mesh::load(root, &selected, origin, cancelled, progress)?;
     let bounds = mesh.bounds;
     let [min_x, min_y, _, max_x, max_y, _] = bounds;

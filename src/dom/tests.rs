@@ -154,7 +154,7 @@ fn request(root: &Path) -> Request {
     )
     .unwrap();
     Request {
-        input,
+        input: input.join("metadata.xml"),
         output: root.join("output"),
         metadata: None,
         crs: None,
@@ -166,12 +166,38 @@ fn request(root: &Path) -> Request {
 }
 
 #[test]
+fn accepts_root_osgb_and_rejects_other_model_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = request(temp.path());
+    let metadata = request.input.clone();
+    let root_osgb = metadata.with_file_name("root.osgb");
+    fs::copy(metadata.with_file_name("tile_L9_0.osgb"), &root_osgb).unwrap();
+    let flag = AtomicBool::new(false);
+
+    request.input = root_osgb.clone();
+    let (summary, _, _) = prepare(&request, &flag, &mut |_| {}).unwrap();
+    assert_eq!(summary.selected, [root_osgb]);
+    assert_eq!(summary.metadata.as_ref(), Some(&metadata));
+
+    let other_xml = metadata.with_file_name("other.xml");
+    fs::copy(&metadata, &other_xml).unwrap();
+    for invalid in [metadata.parent().unwrap().to_owned(), other_xml] {
+        request.input = invalid;
+        let error = prepare(&request, &flag, &mut |_| {}).err().unwrap();
+        assert_eq!(error.to_string(), "请选择根 OSGB 文件或 metadata.xml");
+    }
+}
+
+#[test]
 fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let request = request(temp.path());
     let flag = AtomicBool::new(false);
     let (summary, mesh, _) = prepare(&request, &flag, &mut |_| {}).unwrap();
-    assert_eq!(summary.selected, [request.input.join("tile_L9_0.osgb")]);
+    assert_eq!(
+        summary.selected,
+        [request.input.with_file_name("tile_L9_0.osgb")]
+    );
     assert_eq!(summary.bounds, [112., 218., 23., 116., 222., 26.]);
     assert_eq!(summary.size, [4, 4]);
     let index = raster::index(&mesh.triangles);

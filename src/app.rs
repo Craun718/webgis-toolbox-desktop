@@ -615,8 +615,8 @@ impl RasterForm {
             ui,
             "模型输入",
             &mut self.input,
-            "OSGB 文件或模型目录",
-            PathPicker::FileOrFolder("OSGB", &["osgb"]),
+            "根 OSGB 文件或 metadata.xml",
+            PathPicker::File("OSGB / metadata.xml", &["osgb", "xml"]),
         );
         if path_field(
             ui,
@@ -627,13 +627,15 @@ impl RasterForm {
         ) {
             self.overwrite = false;
         }
-        path_field(
-            ui,
-            "元数据",
-            &mut self.metadata,
-            "留空自动发现 metadata.xml",
-            PathPicker::File("XML", &["xml"]),
-        );
+        if !dom::is_metadata_file(Path::new(self.input.trim())) {
+            path_field(
+                ui,
+                "元数据",
+                &mut self.metadata,
+                "留空自动发现 metadata.xml",
+                PathPicker::File("XML", &["xml"]),
+            );
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label("坐标模式");
             for mode in [dom::Mode::Relative, dom::Mode::Absolute, dom::Mode::Local] {
