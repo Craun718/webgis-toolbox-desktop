@@ -141,6 +141,7 @@ impl Worker {
 
 impl App {
     pub fn new(ctx: &EguiContext) -> Self {
+        ctx.all_styles_mut(|style| style.spacing.button_padding += egui::vec2(2.0, 2.0));
         Self {
             selected: Tool::Raster,
             raster: RasterForm {
@@ -277,8 +278,11 @@ impl eframe::App for App {
                 ui.heading("WebGIS 工具箱");
                 ui.add_space(16.);
                 ui.add_enabled_ui(!busy, |ui| {
-                    self.tool_link(ui, Tool::Raster);
-                    self.tool_link(ui, Tool::Clip);
+                    ui.label(RichText::new("三维模型").strong());
+                    ui.indent("model_tools", |ui| {
+                        self.tool_link(ui, Tool::Raster);
+                        self.tool_link(ui, Tool::Clip);
+                    });
                     ui.add_space(8.);
                     ui.label(RichText::new("瓦片处理").strong());
                     ui.indent("tile_tools", |ui| {
@@ -406,7 +410,7 @@ fn paths(ui: &mut Ui, paths: &[PathBuf]) {
         ui.horizontal_wrapped(|ui| {
             let value = path.display().to_string();
             ui.label(&value);
-            if ui.small_button("复制路径").clicked() {
+            if ui.button("复制路径").clicked() {
                 ui.ctx().copy_text(value);
             }
         });
@@ -484,19 +488,18 @@ fn show_outcome(ui: &mut Ui, outcome: &Result<Outcome>) {
 
 fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.label(label);
-    text_edit(ui, value, hint)
+    let changed = text_edit(ui, value, hint);
+    ui.add_space(4.);
+    changed
 }
 
 fn text_edit(ui: &mut Ui, value: &mut String, hint: &str) -> bool {
-    let changed = ui
-        .add(
-            egui::TextEdit::singleline(value)
-                .hint_text(hint)
-                .desired_width(f32::INFINITY),
-        )
-        .changed();
-    ui.add_space(4.);
-    changed
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY),
+    )
+    .changed()
 }
 
 #[derive(Clone, Copy)]
@@ -515,66 +518,97 @@ fn path_field(
     hint: &str,
     picker: PathPicker,
 ) -> bool {
-    let mut picked = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(label);
-        let current = Path::new(value.trim());
-        let dialog = || {
-            let mut dialog = rfd::FileDialog::new().set_title(label);
-            if let Some(directory) = current.ancestors().find(|path| path.is_dir()) {
-                dialog = dialog.set_directory(directory);
-            }
-            dialog
-        };
-        match picker {
-            PathPicker::File(name, extensions) | PathPicker::FileOrFolder(name, extensions) => {
-                if ui.small_button("选择文件…").clicked() {
-                    picked = dialog().add_filter(name, extensions).pick_file();
+    ui.label(label);
+    let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    let row = ui.allocate_ui_with_layout(
+        row_size,
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let mut picked = None;
+            let current = Path::new(value.trim());
+            let dialog = || {
+                let mut dialog = rfd::FileDialog::new().set_title(label);
+                if let Some(directory) = current.ancestors().find(|path| path.is_dir()) {
+                    dialog = dialog.set_directory(directory);
                 }
+                dialog
+            };
+            if matches!(picker, PathPicker::Folder | PathPicker::FileOrFolder(..))
+                && ui.button("选择目录…").clicked()
+            {
+                picked = dialog().pick_folder();
             }
-            PathPicker::SaveFile(name, extensions, default_name) => {
-                if ui.small_button("选择保存位置…").clicked() {
-                    let file_name = current
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .filter(|_| !current.is_dir())
-                        .unwrap_or(default_name);
-                    picked = dialog()
-                        .add_filter(name, extensions)
-                        .set_file_name(file_name)
-                        .save_file();
-                }
-            }
-            PathPicker::NewFolder => {
-                if ui.small_button("指定新目录…").clicked() {
-                    let mut dialog = dialog();
-                    if let Some(name) = current.file_name().and_then(|name| name.to_str())
-                        && !current.is_dir()
-                    {
-                        dialog = dialog.set_file_name(name);
+            match picker {
+                PathPicker::File(name, extensions) | PathPicker::FileOrFolder(name, extensions) => {
+                    if ui.button("选择文件…").clicked() {
+                        picked = dialog().add_filter(name, extensions).pick_file();
                     }
-                    // 导出任务会创建目录，因此这里只选定目标路径。
-                    picked = dialog.save_file();
+                }
+                PathPicker::SaveFile(name, extensions, default_name) => {
+                    if ui.button("选择保存位置…").clicked() {
+                        let file_name = current
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .filter(|_| !current.is_dir())
+                            .unwrap_or(default_name);
+                        picked = dialog()
+                            .add_filter(name, extensions)
+                            .set_file_name(file_name)
+                            .save_file();
+                    }
+                }
+                PathPicker::NewFolder => {
+                    if ui.button("指定新目录…").clicked() {
+                        let mut dialog = dialog();
+                        if let Some(name) = current.file_name().and_then(|name| name.to_str())
+                            && !current.is_dir()
+                        {
+                            dialog = dialog.set_file_name(name);
+                        }
+                        // 导出任务会创建目录，因此这里只选定目标路径。
+                        picked = dialog.save_file();
+                    }
+                }
+                PathPicker::Folder => {}
+            }
+            let mut changed = false;
+            if let Some(path) = picked {
+                let selected = path.to_string_lossy();
+                if value != selected.as_ref() {
+                    *value = selected.into_owned();
+                    changed = true;
                 }
             }
-            PathPicker::Folder => {}
-        }
-        if matches!(picker, PathPicker::Folder | PathPicker::FileOrFolder(..))
-            && ui.small_button("选择目录…").clicked()
-        {
-            picked = dialog().pick_folder();
-        }
-    });
-    let mut changed = false;
-    if let Some(path) = picked {
-        let selected = path.to_string_lossy();
-        changed = value != selected.as_ref();
-        if changed {
-            *value = selected.into_owned();
-        }
+            let edited = text_edit(ui, value, hint);
+            changed || edited
+        },
+    );
+    ui.add_space(4.);
+    row.inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_field_uses_one_control_row() {
+        egui::__run_test_ui(|ui| {
+            ui.allocate_ui(egui::vec2(500., 400.), |ui| {
+                let start_y = ui.next_widget_position().y;
+                let max_height = ui.text_style_height(&egui::TextStyle::Body)
+                    + ui.spacing().interact_size.y
+                    + 3. * ui.spacing().item_spacing.y
+                    + 4.;
+                path_field(ui, "输入路径", &mut String::new(), "", PathPicker::Folder);
+                let height = ui.next_widget_position().y - start_y;
+                assert!(
+                    height <= max_height,
+                    "路径字段高度为 {height}，上限为 {max_height}"
+                );
+            });
+        });
     }
-    let edited = text_edit(ui, value, hint);
-    changed || edited
 }
 
 fn required_path(label: &str, value: &str) -> Result<PathBuf> {
