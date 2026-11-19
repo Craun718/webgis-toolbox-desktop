@@ -170,7 +170,7 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let request = request(temp.path());
     let flag = AtomicBool::new(false);
-    let (summary, mesh) = prepare(&request, &flag, &mut |_| {}).unwrap();
+    let (summary, mesh, _) = prepare(&request, &flag, &mut |_| {}).unwrap();
     assert_eq!(summary.selected, [request.input.join("tile_L9_0.osgb")]);
     assert_eq!(summary.bounds, [112., 218., 23., 116., 222., 26.]);
     assert_eq!(summary.size, [4, 4]);
@@ -190,7 +190,7 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     };
     let (z, pixels) = render([0, 0, 4, 4]);
     assert_eq!(z[0], 26.);
-    assert_eq!(z[3], gdal::NODATA);
+    assert_eq!(z[3], NODATA);
     assert_eq!(
         [pixels[0][0], pixels[1][0], pixels[2][0], pixels[3][0]],
         [240, 0, 0, 255]
@@ -241,11 +241,10 @@ fn publication_restores_all_old_outputs_if_an_install_fails() {
 }
 
 #[test]
-#[ignore = "需要 GDAL 3.9+ 运行库"]
-fn gdal_writes_verified_products_and_cancellation_preserves_them() {
+fn rust_writes_verified_products_and_cancellation_preserves_them() {
     let temp = tempfile::tempdir().unwrap();
     let mut request = request(temp.path());
-    request.crs = Some("+proj=tmerc +lat_0=0 +lon_0=111 +k=0.9997 +x_0=500000 +y_0=0 +ellps=GRS80 +units=m +type=crs".into());
+    request.crs = Some(r#"PROJCRS["CGCS2000",ID["EPSG",4547]]"#.into());
     let flag = AtomicBool::new(false);
     let files = run(&request, &flag, |_| {}, || Ok(())).unwrap();
     assert_eq!(files.len(), PRODUCTS.len());
@@ -283,4 +282,86 @@ fn gdal_writes_verified_products_and_cancellation_preserves_them() {
         fs::read_dir(&request.output).unwrap().count(),
         PRODUCTS.len()
     );
+}
+
+#[test]
+fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
+    use tiff::{
+        decoder::{Decoder, DecodingResult},
+        tags::Tag,
+    };
+
+    let temp = tempfile::tempdir()?;
+    let mut request = request(temp.path());
+    request.mode = Mode::Local;
+    request.output = temp.path().join("local");
+    request.resolution = 0.01;
+    let cancelled = AtomicBool::new(false);
+    let paths = run(&request, &cancelled, |_| {}, || Ok(()))?;
+    let base_dir = |path| -> Result<_> { Ok(Decoder::new(fs::File::open(path)?)?) };
+    let mut dsm = base_dir(&paths[0])?;
+    let mut dom = base_dir(&paths[1])?;
+    assert_eq!(dsm.dimensions()?, (400, 400));
+    assert_eq!(dom.dimensions()?, (400, 400));
+    assert!(dsm.find_tag(Tag::GeoKeyDirectoryTag)?.is_none());
+    assert_eq!(
+        dsm.get_tag_f64_vec(Tag::ModelTiepointTag)?,
+        [0., 0., 0., 112., 222., 0.]
+    );
+    assert_eq!(dsm.get_tag_ascii_string(Tag::GdalNodata)?, "-9999");
+    let DecodingResult::F32(pixels) = dsm.read_image()? else {
+        panic!("DSM 应为 Float32");
+    };
+    assert_eq!(&pixels[280 * 400 + 255..][..2], &[26., 26.]);
+    assert_eq!(pixels[4 * 400 + 255], NODATA);
+    let DecodingResult::U8(base) = dom.read_image()? else {
+        panic!("DOM 应为 RGB");
+    };
+    dom.next_image()?;
+    let base_mask = tiff_mask::Mask::read_tags(&mut dom.image_ifd())?;
+    let mut mask_data = fs::File::open(&paths[1])?;
+    let bits = [
+        base_mask.read_chunk(&mut mask_data, 2)?,
+        base_mask.read_chunk(&mut mask_data, 3)?,
+    ];
+    for x in [255, 256] {
+        assert!(base_mask.valid(&bits[x / TILE], x % TILE, 280 % TILE));
+    }
+    for factor in [2, 4, 8, 16] {
+        dsm.next_image()?;
+        dom.next_image()?;
+        let size = 400_u32.div_ceil(factor);
+        assert_eq!(dsm.dimensions()?, (size, size));
+        assert_eq!(dom.dimensions()?, (size, size));
+        let DecodingResult::U8(overview) = dom.read_image()? else {
+            panic!("DOM 概览应为 RGB");
+        };
+        dom.next_image()?;
+        assert_eq!(dom.get_tag_u32(Tag::NewSubfileType)?, 5);
+        let mask = tiff_mask::Mask::read_tags(&mut dom.image_ifd())?;
+        let packed = mask.read_chunk(&mut mask_data, 0)?;
+        let factor = factor as usize;
+        for (ox, oy) in [(255 / factor, 280 / factor), (256 / factor, 280 / factor)] {
+            let mut sum = [0_u32; 3];
+            let mut count = 0_u32;
+            for y in oy * factor..(oy + 1) * factor {
+                for x in ox * factor..(ox + 1) * factor {
+                    if base_mask.valid(&bits[x / TILE], x % TILE, y % TILE) {
+                        let start = (y * 400 + x) * 3;
+                        for (total, &value) in sum.iter_mut().zip(&base[start..start + 3]) {
+                            *total += u32::from(value);
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            assert!(count > 0 && mask.valid(&packed, ox, oy));
+            let start = (oy * size as usize + ox) * 3;
+            assert_eq!(
+                &overview[start..start + 3],
+                &sum.map(|value| ((value + count / 2) / count) as u8)
+            );
+        }
+    }
+    Ok(())
 }

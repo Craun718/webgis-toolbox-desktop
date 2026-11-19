@@ -124,83 +124,58 @@ fn mosaic_and_stacta_xyz_tms() {
         &serde_json::json!({"min_tile_col": 0, "max_tile_col": 1, "min_tile_row": 1, "max_tile_row": 2})
     );
 
-    if std::env::var_os("TILES_TEST_GDAL").is_some() {
-        let output = gdal(root, "gdalinfo", &["-json", "xyz.tif"]);
-        let info: Value = serde_json::from_str(&output).unwrap();
-        assert!(
-            info["coordinateSystem"]["wkt"]
-                .as_str()
-                .unwrap()
-                .contains("3857")
+    let mut mosaic =
+        tiff::decoder::Decoder::new(fs::File::open(root.join("xyz.tif")).unwrap()).unwrap();
+    use tiff::{decoder::DecodingResult, tags::Tag};
+    assert_eq!(mosaic.dimensions().unwrap(), (32, 32));
+    assert_eq!(mosaic.get_tag_u16_vec(Tag::ExtraSamples).unwrap(), [2]);
+    assert_eq!(
+        mosaic.get_tag_u16_vec(Tag::GeoKeyDirectoryTag).unwrap(),
+        [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 3857]
+    );
+    let half = std::f64::consts::PI * 6_378_137.0;
+    let scale = mosaic.get_tag_f64_vec(Tag::ModelPixelScaleTag).unwrap();
+    let tie = mosaic.get_tag_f64_vec(Tag::ModelTiepointTag).unwrap();
+    assert!((scale[0] - half / 32.0).abs() < 1e-7);
+    assert!((scale[1] - half / 32.0).abs() < 1e-7);
+    assert!((tie[3] + half).abs() < 1e-7);
+    assert!((tie[4] - half / 2.0).abs() < 1e-7);
+    let DecodingResult::U8(pixels) = mosaic.read_image().unwrap() else {
+        panic!("expected RGBA")
+    };
+    assert_eq!(&pixels[..4], &RED);
+    assert_eq!(&pixels[16 * 32 * 4..][..4], &[0; 4]);
+    for directory in ["xyz", "exported"] {
+        let index = stacta_index(root, directory);
+        assert_eq!(tile_asset(&index, 2, 0, 1), "./2/0/1.png");
+        assert_eq!(stacta_pixel(root, directory, 2, 0, 1), Some(RED));
+        assert_eq!(stacta_pixel(root, directory, 2, 0, 2), None);
+        assert_eq!(
+            stacta_pixel(root, directory, 0, 0, 0),
+            Some([55, 66, 77, 255])
         );
-        assert_eq!(info["size"], serde_json::json!([32, 32]));
-        assert_eq!(info["bands"][3]["colorInterpretation"], "Alpha");
-        let gt = info["geoTransform"].as_array().unwrap();
-        let half = std::f64::consts::PI * 6_378_137.0;
-        for (value, expected) in
-            gt.iter()
-                .zip([-half, half / 32.0, 0.0, half / 2.0, 0.0, -half / 32.0])
-        {
-            assert!((value.as_f64().unwrap() - expected).abs() < 1e-7);
-        }
-        for path in [
-            "xyz.tif",
-            "tms.tif",
-            "xyz/stacta.json",
-            "exported/stacta.json",
-        ] {
-            let args = [
-                "-oo",
-                "SKIP_MISSING_METATILE=YES",
-                "-valonly",
-                path,
-                "0",
-                "0",
-            ];
-            let args = if path.ends_with(".tif") {
-                &args[2..]
-            } else {
-                &args[..]
-            };
-            assert_eq!(gdal(root, "gdallocationinfo", args), "240\n0\n0\n128");
-            let mut missing = args.to_vec();
-            *missing.last_mut().unwrap() = "16";
-            assert_eq!(gdal(root, "gdallocationinfo", &missing), "0\n0\n0\n0");
-            if path.ends_with(".json") {
-                assert_eq!(
-                    gdal(
-                        root,
-                        "gdallocationinfo",
-                        &[
-                            "-oo",
-                            "SKIP_MISSING_METATILE=YES",
-                            "-valonly",
-                            "-overview",
-                            "1",
-                            path,
-                            "0",
-                            "0"
-                        ]
-                    ),
-                    "55\n66\n77\n255"
-                );
-            }
-        }
     }
 }
 
-fn gdal(root: &Path, program: &str, args: &[&str]) -> String {
-    let out = Command::new(program)
-        .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{program} {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+fn stacta_index(root: &Path, directory: &str) -> Value {
+    serde_json::from_slice(&fs::read(root.join(directory).join("stacta.json")).unwrap()).unwrap()
+}
+
+fn tile_asset(index: &Value, zoom: u8, x: u32, y: u32) -> String {
+    index["asset_templates"]["tiles"]["href"]
+        .as_str()
+        .unwrap()
+        .replace("{TileMatrix}", &zoom.to_string())
+        .replace("{TileCol}", &x.to_string())
+        .replace("{TileRow}", &y.to_string())
+}
+
+fn stacta_pixel(root: &Path, directory: &str, zoom: u8, x: u32, y: u32) -> Option<[u8; 4]> {
+    let path = root
+        .join(directory)
+        .join(tile_asset(&stacta_index(root, directory), zoom, x, y));
+    path.exists()
+        .then(|| image::open(path).unwrap().into_rgba8().get_pixel(0, 0).0)
 }
 
 #[test]
@@ -447,24 +422,14 @@ fn stacta_opens_sparse_level_without_a_tile_at_the_origin() {
     assert_eq!(bbox[2], 0.0);
     assert!((bbox[3].as_f64().unwrap() - 85.0511287798).abs() < 1e-9);
 
-    if std::env::var_os("TILES_TEST_GDAL").is_some() {
-        let path = "sparse/stacta.json";
-        let read = |x| {
-            gdal(
-                root,
-                "gdallocationinfo",
-                &["-oo", "SKIP_MISSING_METATILE=YES", "-valonly", path, x, "0"],
-            )
-        };
-        assert_eq!(read("0"), "0\n0\n0\n0");
-        assert_eq!(read("16"), "240\n0\n0\n128");
-    }
+    assert_eq!(stacta_pixel(root, "sparse", 2, 0, 0), None);
+    assert_eq!(stacta_pixel(root, "sparse", 2, 1, 0), Some(RED));
 
     tile(root, "high/30/134217728/0.png", RED);
     fail(
         root,
         &["stacta", "high", "--datetime", DATETIME],
-        "超出 GDAL STACTA 的 32 位限制",
+        "超出 STACTA 的 32 位兼容范围",
     );
 }
 
@@ -490,31 +455,19 @@ fn stacta_reads_webp_and_jpeg_pyramids() {
             ],
         );
         run(root, &["stacta", format, "--datetime", DATETIME]);
-        if std::env::var_os("TILES_TEST_GDAL").is_some() {
-            let path = format!("{format}/stacta.json");
-            let pixel = gdal(
-                root,
-                "gdallocationinfo",
-                &[
-                    "-oo",
-                    "SKIP_MISSING_METATILE=YES",
-                    "-valonly",
-                    &path,
-                    "0",
-                    "0",
-                ],
+        let index = stacta_index(root, format);
+        let asset = tile_asset(&index, 2, 0, 1);
+        assert!(asset.ends_with(if format == "jpeg" { ".jpg" } else { ".webp" }));
+        let pixel = stacta_pixel(root, format, 2, 0, 1).unwrap();
+        if format == "webp" {
+            assert_eq!(pixel, RED);
+        } else {
+            assert!(
+                pixel[0].abs_diff(247) <= 3
+                    && pixel[1].abs_diff(127) <= 3
+                    && pixel[2].abs_diff(127) <= 3
+                    && pixel[3] == 255
             );
-            if format == "webp" {
-                assert_eq!(pixel, "240\n0\n0\n128");
-            } else {
-                let rgb: Vec<u8> = pixel.lines().map(|line| line.parse().unwrap()).collect();
-                assert_eq!(rgb.len(), 3);
-                assert!(
-                    rgb[0].abs_diff(247) <= 3
-                        && rgb[1].abs_diff(127) <= 3
-                        && rgb[2].abs_diff(127) <= 3
-                );
-            }
         }
     }
 }

@@ -1,9 +1,13 @@
-mod gdal;
+mod geotiff;
 pub mod map_tiles;
 mod raster;
+mod tiff_mask;
+mod tiff_output;
+mod tiff_source;
+mod tile_sampling;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use gdal::{Gdal, TILE};
+use geotiff::{Affine, Crs};
 use raster::{Mesh, TextureCache};
 use regex::Regex;
 use serde::Serialize;
@@ -13,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
+use tiff_output::{BigTiff, LevelWriter, NODATA, RasterKind, RasterSpec, TILE};
 use walkdir::WalkDir;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -192,7 +197,7 @@ fn prepare(
     request: &Request,
     cancelled: &AtomicBool,
     progress: &mut impl FnMut(Progress),
-) -> Result<(Summary, Mesh)> {
+) -> Result<(Summary, Mesh, Option<Crs>)> {
     ensure!(
         request.resolution.is_finite() && request.resolution > 0.,
         "分辨率必须为有限正数"
@@ -246,14 +251,23 @@ fn prepare(
     ensure!(origin.iter().all(|v| v.is_finite()), "原点须为有限数值");
     let crs = match request.mode {
         Mode::Local => None,
-        _ => Some(
-            request
-                .crs
-                .clone()
-                .or(metadata_crs)
-                .context("缺少 SRS，请指定坐标系或选择本地模式")?,
-        ),
+        _ => Some(request.crs.clone().or(metadata_crs).with_context(|| {
+            let source = metadata.as_ref().unwrap_or(&input);
+            format!("{} 缺少 SRS，请指定坐标系或选择本地模式", source.display())
+        })?),
     };
+    let epsg = crs
+        .as_deref()
+        .map(Crs::parse)
+        .transpose()
+        .with_context(|| {
+            let source = if request.crs.is_some() {
+                &input
+            } else {
+                metadata.as_ref().unwrap_or(&input)
+            };
+            format!("{} 的坐标系无效", source.display())
+        })?;
     let root = if input.is_dir() {
         input.as_path()
     } else {
@@ -271,7 +285,7 @@ fn prepare(
         [max_x - min_x, max_y - min_y].map(|span| (span / request.resolution).ceil().max(1.));
     ensure!(
         size.iter().all(|v| *v <= f64::from(i32::MAX)),
-        "栅格尺寸超出 GDAL 支持范围"
+        "栅格尺寸超出支持范围"
     );
     let summary = Summary {
         selected,
@@ -284,7 +298,7 @@ fn prepare(
         resolution: request.resolution,
         triangles: mesh.triangles.len(),
     };
-    Ok((summary, mesh))
+    Ok((summary, mesh, epsg))
 }
 
 pub fn preflight(
@@ -292,11 +306,7 @@ pub fn preflight(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress),
 ) -> Result<Summary> {
-    let api = Gdal::load()?;
-    let (summary, _) = prepare(request, cancelled, &mut progress)?;
-    if let Some(crs) = &summary.crs {
-        api.srs(crs)?;
-    }
+    let (summary, _, _) = prepare(request, cancelled, &mut progress)?;
     check_cancelled(cancelled)?;
     Ok(summary)
 }
@@ -307,9 +317,7 @@ pub fn run(
     mut progress: impl FnMut(Progress),
     before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<Vec<PathBuf>> {
-    let api = Gdal::load()?;
-    let (summary, mesh) = prepare(request, cancelled, &mut progress)?;
-    let srs = summary.crs.as_deref().map(|s| api.srs(s)).transpose()?;
+    let (summary, mesh, crs) = prepare(request, cancelled, &mut progress)?;
     check_cancelled(cancelled)?;
     fs::create_dir_all(&request.output)?;
     let output = request.output.canonicalize()?;
@@ -325,22 +333,17 @@ pub fn run(
     let [width, height] = summary.size;
     let [west, _, _, _, north, _] = summary.bounds;
     let res = summary.resolution;
-    let transform = [west, res, 0., north, 0., -res];
-    let _config = api.configure();
-    let dsm = api.create(
-        &stage.join(PRODUCTS[0]),
-        summary.size,
-        transform,
-        srs.as_ref(),
-        false,
-    )?;
-    let dom = api.create(
-        &stage.join(PRODUCTS[1]),
-        summary.size,
-        transform,
-        srs.as_ref(),
-        true,
-    )?;
+    let spec = RasterSpec {
+        size: summary.size.map(|v| v as usize),
+        transform: Affine([west, res, 0., north, 0., -res]),
+        crs,
+    };
+    let dsm_path = stage.join(PRODUCTS[0]);
+    let dom_path = stage.join(PRODUCTS[1]);
+    let mut dsm_file = BigTiff::new_big(fs::File::create(&dsm_path)?)?;
+    let mut dom_file = BigTiff::new_big(fs::File::create(&dom_path)?)?;
+    let mut dsm = LevelWriter::new(&mut dsm_file, RasterKind::Dsm)?;
+    let mut dom = LevelWriter::new(&mut dom_file, RasterKind::Dom)?;
     let index = raster::index(&mesh.triangles);
     let mut textures = TextureCache::new(&mesh.images);
     let (w, h) = (width as usize, height as usize);
@@ -360,12 +363,12 @@ pub fn run(
                 rect,
                 cancelled,
             )?;
-            let (mut z, mut color) = block.into_planes();
-            dsm_valid_pixels += z.iter().filter(|&&v| v != gdal::NODATA).count() as u64;
+            let (z, color) = block.into_planes();
+            dsm_valid_pixels += z.iter().filter(|&&v| v != NODATA).count() as u64;
             dom_valid_pixels += color[3].iter().filter(|&&v| v != 0).count() as u64;
-            let rect = rect.map(|v| v as i32);
-            dsm.write_dsm(rect, &mut z)?;
-            dom.write_dom(rect, &mut color)?;
+            let size = [rect[2], rect[3]];
+            dsm.height(size, &z)?;
+            dom.color(size, &color)?;
             done += 1;
             progress(Progress {
                 stage: format!("栅格化 {done}/{count} 块"),
@@ -381,38 +384,48 @@ pub fn run(
         dom_valid_pixels > 0,
         "最高表面没有可见纹理像元，无法生成 DOM"
     );
+    dsm.finish(spec, false)?;
+    if let Some(mask) = dom.finish(spec, false)? {
+        mask.finish(&mut dom_file)?;
+    }
     let levels: Vec<_> = [2, 4, 8, 16]
         .into_iter()
-        .filter(|n| *n <= width.min(height))
+        .filter(|&n| n <= w.min(h))
         .collect();
     progress(Progress {
         stage: "构建内部概览".into(),
         fraction: None,
     });
-    dsm.overviews(&levels, cancelled)?;
-    dom.overviews(&levels, cancelled)?;
-    dsm.close()?;
-    dom.close()?;
+    tiff_output::overviews(
+        &mut dsm_file,
+        &dsm_path,
+        spec,
+        RasterKind::Dsm,
+        &levels,
+        cancelled,
+    )
+    .with_context(|| format!("构建 {} 的内部概览", PRODUCTS[0]))?;
+    tiff_output::overviews(
+        &mut dom_file,
+        &dom_path,
+        spec,
+        RasterKind::Dom,
+        &levels,
+        cancelled,
+    )
+    .with_context(|| format!("构建 {} 的内部概览", PRODUCTS[1]))?;
+    drop((dsm_file, dom_file));
     progress(Progress {
         stage: "校验写出结果".into(),
         fraction: None,
     });
-    api.verify(
-        &stage.join(PRODUCTS[0]),
-        summary.size,
-        transform,
-        srs.as_ref(),
-        &levels,
-        false,
-    )?;
-    api.verify(
-        &stage.join(PRODUCTS[1]),
-        summary.size,
-        transform,
-        srs.as_ref(),
-        &levels,
-        true,
-    )?;
+    for (path, kind, valid) in [
+        (&dsm_path, RasterKind::Dsm, dsm_valid_pixels),
+        (&dom_path, RasterKind::Dom, dom_valid_pixels),
+    ] {
+        tiff_output::verify(path, spec, kind, &levels, valid, cancelled)
+            .with_context(|| format!("校验 {}", path.display()))?;
+    }
     let products: Vec<_> = PRODUCTS.iter().map(|name| output.join(name)).collect();
     let report = RunReport {
         schema_version: 1,

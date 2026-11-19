@@ -15,3 +15,6 @@ serde_json = "1.0.154"
 tempfile = "3.27.0"
 tiff-core = { version = "0.11.1", default-features = false }
 tiff-writer = { version = "0.11.1", default-features = false }
+
+[dev-dependencies]
+tiff = { version = "0.11.3", default-features = false, features = ["deflate"] }

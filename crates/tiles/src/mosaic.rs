@@ -98,18 +98,10 @@ mod tests {
         assert!(ifd_offset >= 1_u64 << 32);
         assert!(ifd_offset < file.seek(SeekFrom::End(0)).unwrap());
 
-        if std::env::var_os("TILES_TEST_GDAL").is_some() {
-            let info = std::process::Command::new("gdallocationinfo")
-                .arg("-valonly")
-                .arg(output)
-                .args(["0", "0"])
-                .output()
-                .unwrap();
-            assert!(info.status.success(), "{:?}", info.stderr);
-            assert_eq!(
-                String::from_utf8(info.stdout).unwrap().trim(),
-                "31\n63\n127\n128"
-            );
-        }
+        let mut decoder = tiff::decoder::Decoder::new(File::open(output).unwrap()).unwrap();
+        let tiff::decoder::DecodingResult::U8(pixels) = decoder.read_chunk(0).unwrap() else {
+            panic!("expected RGBA");
+        };
+        assert_eq!(&pixels[..4], &[31, 63, 127, 128]);
     }
 }

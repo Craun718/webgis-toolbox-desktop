@@ -1,0 +1,583 @@
+use super::*;
+use crate::dom::{
+    geotiff::{Affine, Crs, write_geotags},
+    tiff_output::{BigTiff, LevelWriter, RasterKind, RasterSpec},
+};
+use std::{fs, path::Path};
+use tiff::{
+    encoder::{Compression, TiffEncoder},
+    tags::{Predictor, Tag},
+};
+
+fn make_rgb(path: &Path, crs: Option<&str>, transform: [f64; 6], empty: bool) -> Result<()> {
+    let mut file = BigTiff::new_big(fs::File::create(path)?)?;
+    let mut level = LevelWriter::new(&mut file, RasterKind::Dom)?;
+    for row in 0..2 {
+        for column in 0..2 {
+            let mut alpha = vec![if empty || column == 1 { 0 } else { 255 }; TILE * TILE];
+            if !empty && column == 0 {
+                for values in alpha.chunks_exact_mut(TILE) {
+                    values[TILE - 1] = 128;
+                }
+            }
+            let planes = [
+                vec![180; TILE * TILE],
+                vec![if row == 0 { 210 } else { 30 }; TILE * TILE],
+                vec![20; TILE * TILE],
+                alpha,
+            ];
+            level.color([TILE; 2], &planes)?;
+        }
+    }
+    level
+        .finish(
+            RasterSpec {
+                size: [512; 2],
+                crs: crs.map(Crs::parse).transpose()?,
+                transform: Affine(transform),
+            },
+            false,
+        )?
+        .unwrap()
+        .finish(&mut file)
+}
+
+fn world_transform() -> Affine {
+    let step = 2.0 * HALF_WORLD / 512.0;
+    Affine([-HALF_WORLD, step, 0., HALF_WORLD, 0., -step])
+}
+
+fn make_alpha(path: &Path, gray: bool) -> Result<()> {
+    use tiff::{
+        encoder::colortype::{ColorType, RGBA8},
+        tags::{PhotometricInterpretation, SampleFormat},
+    };
+    struct GrayA8;
+    impl ColorType for GrayA8 {
+        type Inner = u8;
+        const TIFF_VALUE: PhotometricInterpretation = PhotometricInterpretation::BlackIsZero;
+        const BITS_PER_SAMPLE: &'static [u16] = &[8, 8];
+        const SAMPLE_FORMAT: &'static [SampleFormat] = &[SampleFormat::Uint; 2];
+
+        fn horizontal_predict(row: &[u8], result: &mut Vec<u8>) {
+            result.extend_from_slice(&row[..2]);
+            result.extend(row[2..].iter().zip(row).map(|(a, b)| a.wrapping_sub(*b)));
+        }
+    }
+    let mut file = TiffEncoder::new(fs::File::create(path)?)?
+        .with_compression(Compression::Lzw)
+        .with_predictor(Predictor::Horizontal);
+    let mut values = Vec::new();
+    for _ in 0..512 {
+        for x in 0..512 {
+            if gray {
+                values.push(160);
+            } else {
+                values.extend_from_slice(&[180, 70, 20]);
+            }
+            values.push(match x {
+                0..255 => 255,
+                255 => 128,
+                _ => 0,
+            });
+        }
+    }
+    let crs = Some(Crs::from_code(3857)?);
+    if gray {
+        let mut image = file.new_image::<GrayA8>(512, 512)?;
+        image.rows_per_strip(64)?;
+        write_geotags(image.encoder(), crs, world_transform(), false)?;
+        image.encoder().write_tag(Tag::ExtraSamples, 2_u16)?;
+        image.write_data(&values)?;
+    } else {
+        let mut image = file.new_image::<RGBA8>(512, 512)?;
+        image.rows_per_strip(64)?;
+        write_geotags(image.encoder(), crs, world_transform(), false)?;
+        image.encoder().write_tag(Tag::ExtraSamples, 2_u16)?;
+        image.write_data(&values)?;
+    }
+    Ok(())
+}
+
+fn check_tiling(crs: &str, transform: [f64; 6], prefix: &str) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("source.tif");
+    make_rgb(&input, Some(crs), transform, false)?;
+    let output = root.path().join("tiles");
+    let request = Request {
+        input,
+        output: output.clone(),
+        min_zoom: 0,
+        max_zoom: 0,
+        datetime: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?,
+        id: Some(prefix.to_owned()),
+    };
+    let levels = run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+    assert_eq!(levels, [0]);
+    let moved = root.path().join("relocated");
+    fs::rename(&output, &moved)?;
+    let tile = image::open(moved.join("0/0/0.png"))?.into_rgba8();
+    assert_eq!(tile.dimensions(), (TILE as u32, TILE as u32));
+    assert!(tile.get_pixel(24, 24)[3] > 0);
+    assert_eq!(tile.get_pixel(232, 24)[3], 0);
+    assert!(tile.get_pixel(24, 24)[1] > tile.get_pixel(24, 232)[1]);
+    assert_eq!(&tile.get_pixel(24, 24).0[..3], &[180, 210, 20]);
+    let index_path = moved.join("stacta.json");
+    let index: serde_json::Value = serde_json::from_slice(&fs::read(&index_path)?)?;
+    assert_eq!(index["id"], prefix);
+    assert_eq!(
+        index["properties"]["tiles:tile_matrix_links"]["WebMercatorQuad"]["limits"]["0"]["max_tile_col"],
+        0
+    );
+    assert_eq!(
+        index["asset_templates"]["tiles"]["href"],
+        "./{TileMatrix}/{TileCol}/{TileRow}.png"
+    );
+    Ok(())
+}
+
+fn check_alpha_layout(gray: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("alpha.tif");
+    make_alpha(&input, gray)?;
+    let output = root.path().join("tiles");
+    let request = Request {
+        input,
+        output: output.clone(),
+        min_zoom: 0,
+        max_zoom: 2,
+        datetime: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?,
+        id: None,
+    };
+    run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+    let tile = image::open(output.join("0/0/0.png"))?.into_rgba8();
+    assert!(tile.get_pixel(24, 128)[3] > 0);
+    assert!(tile.get_pixel(127, 128)[3] > 0 && tile.get_pixel(127, 128)[3] < 255);
+    assert_eq!(tile.get_pixel(232, 128)[3], 0);
+    if gray {
+        assert_eq!(&tile.get_pixel(24, 128).0[..3], &[160, 160, 160]);
+    } else {
+        assert_eq!(&tile.get_pixel(24, 128).0[..3], &[180, 70, 20]);
+    }
+    let native = image::open(output.join("1/0/0.png"))?.into_rgba8();
+    assert_eq!(native.get_pixel(255, 128)[3], 128);
+    let index: serde_json::Value = serde_json::from_slice(&fs::read(output.join("stacta.json"))?)?;
+    let last_column = (0..4)
+        .rfind(|column| output.join("2").join(column.to_string()).is_dir())
+        .unwrap();
+    assert!(last_column < 3);
+    assert_eq!(
+        index["properties"]["tiles:tile_matrix_links"]["WebMercatorQuad"]["limits"]["2"]["max_tile_col"],
+        last_column
+    );
+    let upsampled = image::open(output.join("2/1/0.png"))?.into_rgba8();
+    assert!(upsampled.get_pixel(255, 128)[3] > 0 && upsampled.get_pixel(255, 128)[3] < 255);
+    Ok(())
+}
+
+fn check_nodata_mask() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("nodata.tif");
+    let mut file = TiffEncoder::new(fs::File::create(&input)?)?;
+    let mut image = file.new_image::<tiff::encoder::colortype::Gray8>(512, 512)?;
+    write_geotags(
+        image.encoder(),
+        Some(Crs::from_code(3857)?),
+        world_transform(),
+        false,
+    )?;
+    image.encoder().write_tag(Tag::GdalNodata, "0")?;
+    let mut pixels = vec![0; 512 * 512];
+    for row in pixels.chunks_exact_mut(512) {
+        row[..256].fill(160);
+    }
+    image.write_data(&pixels)?;
+    let output = root.path().join("tiles");
+    let request = Request {
+        input,
+        output: output.clone(),
+        min_zoom: 0,
+        max_zoom: 0,
+        datetime: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?,
+        id: None,
+    };
+    run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+    let tile = image::open(output.join("0/0/0.png"))?.into_rgba8();
+    assert!(tile.get_pixel(24, 128)[3] > 0);
+    assert_eq!(tile.get_pixel(232, 128)[3], 0);
+    assert_eq!(&tile.get_pixel(24, 128).0[..3], &[160, 160, 160]);
+    Ok(())
+}
+
+#[test]
+fn xyz_png_and_stacta_preserve_3857_orientation_and_internal_mask() -> Result<()> {
+    let pixel = 2.0 * HALF_WORLD / 512.0;
+    check_tiling(
+        "EPSG:3857",
+        [-HALF_WORLD, pixel, 0.0, HALF_WORLD, 0.0, -pixel],
+        "mercator",
+    )
+}
+
+#[test]
+fn xyz_png_and_stacta_reproject_4326() -> Result<()> {
+    check_tiling(
+        "EPSG:4326",
+        [-180.0, 360.0 / 512.0, 0.0, 85.0, 0.0, -170.0 / 512.0],
+        "geographic",
+    )
+}
+
+#[test]
+fn handles_explicit_rgba_alpha() -> Result<()> {
+    check_alpha_layout(false)
+}
+
+#[test]
+fn handles_gray_alpha() -> Result<()> {
+    check_alpha_layout(true)
+}
+
+#[test]
+fn nodata_pixels_become_transparent() -> Result<()> {
+    check_nodata_mask()
+}
+
+fn tile_request(input: PathBuf, output: PathBuf, zoom: u8) -> Request {
+    Request {
+        input,
+        output,
+        min_zoom: zoom,
+        max_zoom: zoom,
+        datetime: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap(),
+        id: None,
+    }
+}
+
+fn locate([east, north]: [f64; 2], zoom: u8) -> (u32, u32, u32, u32) {
+    let scale = TILE as f64 / tile_span(zoom);
+    let x = ((east + HALF_WORLD) * scale).floor() as u32;
+    let y = ((HALF_WORLD - north) * scale).floor() as u32;
+    (
+        x / TILE as u32,
+        y / TILE as u32,
+        x % TILE as u32,
+        y % TILE as u32,
+    )
+}
+
+#[test]
+fn reprojects_known_geographic_cgcs2000_and_utm_points() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    // 投影坐标取中央经线与北纬 24° 的交点，独立于运行时的反投影。
+    for (code, center, lon, step) in [
+        (4490, [114., 24.], 114_f64, 0.001),
+        (4547, [500_000., 2_655_288.653_822_5], 114., 100.),
+        (32649, [500_000., 2_654_226.538_441_13], 111., 100.),
+    ] {
+        let input = root.path().join(format!("{code}.tif"));
+        let output = root.path().join(code.to_string());
+        let mut file = TiffEncoder::new(fs::File::create(&input)?)?;
+        let mut image = file.new_image::<tiff::encoder::colortype::Gray8>(32, 32)?;
+        let [x, y] = center;
+        let transform = Affine([x - 16. * step, step, 0., y + 16. * step, 0., -step]);
+        write_geotags(
+            image.encoder(),
+            Some(Crs::from_code(code)?),
+            transform,
+            false,
+        )?;
+        let mut values = vec![0; 32 * 32];
+        for row in values.chunks_exact_mut(32).skip(12).take(8) {
+            row[12..20].fill(180);
+        }
+        image.write_data(&values)?;
+        let request = tile_request(input, output.clone(), 12);
+        run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+        let (col, row, px, py) = locate(
+            [
+                HALF_WORLD * lon / 180.,
+                6_378_137. * 24_f64.to_radians().tan().asinh(),
+            ],
+            12,
+        );
+        let tile = image::open(output.join(relative_path(12, col, row, "png")))?.into_rgba8();
+        assert_eq!(
+            tile.get_pixel(px, py).0,
+            [180, 180, 180, 255],
+            "EPSG:{code}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rotated_pixel_is_point_and_area_sampling_preserve_known_pixels() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("rotated.tif");
+    let output = root.path().join("tiles");
+    let step = tile_span(8) / TILE as f64;
+    let point = [(128. + 0.5) * step, (128. + 0.5) * step];
+    let mut file = TiffEncoder::new(fs::File::create(&input)?)?;
+    let mut image = file.new_image::<tiff::encoder::colortype::Gray8>(32, 32)?;
+    let transform = Affine([
+        point[0] - 8. * (step / 2. + step / 4.),
+        step / 2.,
+        step / 4.,
+        point[1] - 8. * (step / 4. - step / 2.),
+        step / 4.,
+        -step / 2.,
+    ]);
+    write_geotags(
+        image.encoder(),
+        Some(Crs::from_code(3857)?),
+        transform,
+        true,
+    )?;
+    image.encoder().write_tag(Tag::GdalNodata, "0")?;
+    let mut values = vec![0; 32 * 32];
+    for row in values.chunks_exact_mut(32).skip(7).take(3) {
+        row[7..10].fill(200);
+    }
+    image.write_data(&values)?;
+    let request = tile_request(input, output.clone(), 8);
+    run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+    let (x, y, px, py) = locate(point, 8);
+    let tiles = image::open(output.join(relative_path(8, x, y, "png")))?.into_rgba8();
+    assert_eq!(tiles.get_pixel(px, py).0, [200, 200, 200, 255]);
+    let edge = tiles.get_pixel(px + 1, py).0;
+    assert_eq!(edge[..3], [200; 3]);
+    assert!(edge[3] > 0 && edge[3] < 255);
+    assert_eq!(tiles.get_pixel(px + 10, py).0, [0; 4]);
+    Ok(())
+}
+
+#[test]
+fn decodes_jpeg_ycbcr_and_sub_ifd_mask() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("jpeg.tif");
+    let mut tiff = TiffEncoder::new(fs::File::create(&path)?)?;
+    let mut mask = tiff.extra_directory()?;
+    let bits = mask.write_data(&[0x80_u8; 32][..])? as u32;
+    for (tag, value) in [
+        (Tag::ImageWidth, 16),
+        (Tag::ImageLength, 16),
+        (Tag::NewSubfileType, 4),
+        (Tag::RowsPerStrip, 16),
+        (Tag::StripByteCounts, 32),
+        (Tag::StripOffsets, bits),
+    ] {
+        mask.write_tag(tag, value)?;
+    }
+    mask.write_tag(Tag::PhotometricInterpretation, 4_u16)?;
+    let pointer = mask.finish_with_offsets()?.offset;
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode(
+        &[200, 100, 25].repeat(16 * 16),
+        16,
+        16,
+        image::ExtendedColorType::Rgb8,
+    )?;
+    let mut dir = tiff.image_directory()?;
+    let offset = dir.write_data(jpeg.as_slice())? as u32;
+    for (tag, value) in [
+        (Tag::ImageWidth, 16),
+        (Tag::ImageLength, 16),
+        (Tag::RowsPerStrip, 16),
+        (Tag::StripByteCounts, jpeg.len() as u32),
+        (Tag::StripOffsets, offset),
+    ] {
+        dir.write_tag(tag, value)?;
+    }
+    dir.write_tag(Tag::SubIfd, pointer)?;
+    dir.write_tag(Tag::BitsPerSample, &[8_u16; 3][..])?;
+    dir.write_tag(Tag::SamplesPerPixel, 3_u16)?;
+    dir.write_tag(Tag::PhotometricInterpretation, 6_u16)?;
+    dir.write_tag(Tag::Compression, 7_u16)?;
+    write_geotags(
+        &mut dir,
+        Some(Crs::from_code(3857)?),
+        world_transform(),
+        false,
+    )?;
+    dir.finish()?;
+    let mut source = Source::open(&path)?;
+    let sample = source.pixel(0, 7)?;
+    assert_eq!(sample[3], 255.);
+    for (sample, expected) in sample.into_iter().zip([200., 100., 25.]) {
+        assert!((sample - expected).abs() < 4.);
+    }
+    assert_eq!(source.pixel(1, 7)?, [0.; 4]);
+    Ok(())
+}
+
+#[test]
+fn reads_large_bigtiff_through_independent_blocks() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("large.tif");
+    let mut file = BigTiff::new_big(fs::File::create(&path)?)?;
+    let mut dir = file.image_directory()?;
+    let offsets = [
+        dir.write_data(&[17_u8; TILE * TILE][..])?,
+        dir.write_data(&[39_u8; TILE * TILE][..])?,
+    ];
+    // 等价于 4 GiB 解压数据，目录可复用相同的未压缩块。
+    let size = 65_536_u32;
+    let count = (size as usize / TILE).pow(2);
+    let positions: Vec<_> = (0..count).map(|i| offsets[i % 2]).collect();
+    dir.write_tag(Tag::ImageWidth, size)?;
+    dir.write_tag(Tag::ImageLength, size)?;
+    dir.write_tag(Tag::PhotometricInterpretation, 1_u16)?;
+    dir.write_tag(Tag::BitsPerSample, 8_u16)?;
+    dir.write_tag(Tag::TileWidth, TILE as u32)?;
+    dir.write_tag(Tag::TileLength, TILE as u32)?;
+    dir.write_tag(Tag::TileOffsets, positions.as_slice())?;
+    dir.write_tag(
+        Tag::TileByteCounts,
+        vec![(TILE * TILE) as u64; count].as_slice(),
+    )?;
+    // 只有左上角的数据块落在 WebMercatorQuad 覆盖范围内。
+    let span = tile_span(8);
+    let step = span / TILE as f64;
+    write_geotags(
+        &mut dir,
+        Some(Crs::from_code(3857)?),
+        Affine([HALF_WORLD - span, step, 0., -HALF_WORLD + span, 0., -step]),
+        false,
+    )?;
+    dir.finish()?;
+    let mut source = Source::open(&path)?;
+    assert_eq!(source.size, [size; 2]);
+    assert_eq!(source.pixel(255, 1067)?, [17., 17., 17., 255.]);
+    assert_eq!(source.pixel(256, 1067)?, [39., 39., 39., 255.]);
+    assert_eq!(source.pixel(65_535, 65_535)?, [39., 39., 39., 255.]);
+    let output = root.path().join("large-tiles");
+    let request = tile_request(path, output.clone(), 8);
+    run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(()))?;
+    let tile = image::open(output.join("8/255/255.png"))?.into_rgba8();
+    assert_eq!(tile.get_pixel(128, 128).0, [17, 17, 17, 255]);
+    Ok(())
+}
+
+#[test]
+fn rejects_missing_georeferencing_and_unknown_or_grid_based_crs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    for (code, reason) in [
+        (3857, "缺少地理定位"),
+        (65000, "没有内置"),
+        (4267, "外部坐标转换格网"),
+    ] {
+        let input = root.path().join(format!("{code}.tif"));
+        let output = root.path().join(code.to_string());
+        let mut tiff = TiffEncoder::new(fs::File::create(&input)?)?;
+        let mut image = tiff.new_image::<tiff::encoder::colortype::Gray8>(16, 16)?;
+        let model = if code == 4267 { 2 } else { 1 };
+        let key = if model == 2 { 2048 } else { 3072 };
+        image.encoder().write_tag(
+            Tag::GeoKeyDirectoryTag,
+            &[1_u16, 1, 0, 2, 1024, 0, 1, model, key, 0, 1, code][..],
+        )?;
+        image.write_data(&[128; 256])?;
+        let request = tile_request(input.clone(), output.clone(), 0);
+        let error = run(&request, &AtomicBool::new(false), |_, _| {}, || Ok(())).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(input.to_str().unwrap()) && error.contains(reason),
+            "{error}"
+        );
+        assert!(!output.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_missing_crs_all_transparent_and_preserves_conflicts_and_cancellation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let transform = [
+        -HALF_WORLD,
+        2.0 * HALF_WORLD / 512.0,
+        0.0,
+        HALF_WORLD,
+        0.0,
+        -2.0 * HALF_WORLD / 512.0,
+    ];
+    let no_crs = root.path().join("no-crs.tif");
+    make_rgb(&no_crs, None, transform, false)?;
+    let output = root.path().join("no-crs-output");
+    let request = |input: PathBuf, output: PathBuf| Request {
+        input,
+        output,
+        min_zoom: 0,
+        max_zoom: 0,
+        datetime: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap(),
+        id: None,
+    };
+    let error = run(
+        &request(no_crs, output.clone()),
+        &AtomicBool::new(false),
+        |_, _| {},
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("缺少坐标系"));
+    assert!(!output.exists());
+
+    let source = root.path().join("transparent.tif");
+    make_rgb(&source, Some("EPSG:3857"), transform, true)?;
+    let transparent_output = root.path().join("transparent-output");
+    let error = run(
+        &request(source.clone(), transparent_output.clone()),
+        &AtomicBool::new(false),
+        |_, _| {},
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("没有有效瓦片"));
+    assert!(!transparent_output.exists());
+
+    let conflict = root.path().join("existing");
+    fs::create_dir(&conflict)?;
+    fs::write(conflict.join("keep.txt"), b"preserve")?;
+    let error = run(
+        &request(source.clone(), conflict.clone()),
+        &AtomicBool::new(false),
+        |_, _| {},
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("已存在"));
+    assert_eq!(fs::read(conflict.join("keep.txt"))?, b"preserve");
+
+    let valid_source = root.path().join("valid.tif");
+    make_rgb(&valid_source, Some("EPSG:3857"), transform, false)?;
+    let entries_before = fs::read_dir(root.path())?.count();
+    let output = root.path().join("cancelled-during-index");
+    let cancelled = AtomicBool::new(false);
+    let error = run(
+        &request(valid_source, output.clone()),
+        &cancelled,
+        |stage, _| {
+            if stage == "生成 STACTA 索引" {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+        || panic!("取消后仍尝试发布"),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("已取消"));
+    assert!(!output.exists());
+    assert_eq!(fs::read_dir(root.path())?.count(), entries_before);
+
+    let cancelled_output = root.path().join("cancelled");
+    let cancelled = AtomicBool::new(true);
+    let error = run(
+        &request(source, cancelled_output.clone()),
+        &cancelled,
+        |_, _| {},
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("已取消"));
+    assert!(!cancelled_output.exists());
+    Ok(())
+}

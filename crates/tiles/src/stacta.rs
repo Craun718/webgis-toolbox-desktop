@@ -117,7 +117,7 @@ pub fn write_rgba_png(
     write_index(root, id, datetime, size, ("png", 4, Format::Png), levels)
 }
 
-/// 校验 GDAL STACTA 使用的原点偏移和栅格尺寸。
+/// 校验原点偏移和栅格尺寸能否由 32 位 STACTA 阅读器表示。
 pub fn check_raster_size(zoom: u8, bounds: Bounds, tile_size: u32) -> Result<()> {
     ensure!(zoom <= crate::tiles::MAX_ZOOM, "瓦片级别超出范围：{zoom}");
     let matrix_width = 1_u32 << zoom;
@@ -128,13 +128,13 @@ pub fn check_raster_size(zoom: u8, bounds: Bounds, tile_size: u32) -> Result<()>
             && bounds.max_y < matrix_width,
         "级别 {zoom} 的瓦片范围无效"
     );
-    let fits_gdal = |tiles: u32| u64::from(tiles) * u64::from(tile_size) <= i32::MAX as u64;
+    let fits_i32 = |tiles: u32| u64::from(tiles) * u64::from(tile_size) <= i32::MAX as u64;
     ensure!(
-        fits_gdal(bounds.min_x)
-            && fits_gdal(bounds.min_y)
-            && fits_gdal(bounds.max_x - bounds.min_x + 1)
-            && fits_gdal(bounds.max_y - bounds.min_y + 1),
-        "级别 {zoom} 的像元原点偏移或栅格尺寸超出 GDAL STACTA 的 32 位限制"
+        fits_i32(bounds.min_x)
+            && fits_i32(bounds.min_y)
+            && fits_i32(bounds.max_x - bounds.min_x + 1)
+            && fits_i32(bounds.max_y - bounds.min_y + 1),
+        "级别 {zoom} 的像元原点偏移或栅格尺寸超出 STACTA 的 32 位兼容范围"
     );
     Ok(())
 }

@@ -3128,6 +3128,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde_json",
  "tempfile",
+ "tiff",
  "tiff-core",
  "tiff-writer",
 ]
@@ -3601,9 +3602,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "crs-definitions",
  "eframe",
+ "flate2",
  "image",
- "libloading",
+ "proj4rs",
  "quick-xml",
  "regex",
  "rfd",
@@ -3612,9 +3615,11 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tiff",
  "tiles-toolbox",
  "walkdir",
  "webgis-core",
+ "weezl 0.1.12",
 ]
 
 [[package]]

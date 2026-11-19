@@ -1,4 +1,4 @@
-use super::{Progress, Summary, check_cancelled, gdal::NODATA};
+use super::{Progress, Summary, check_cancelled, tiff_output::NODATA};
 use anyhow::{Context, Result, anyhow, ensure};
 use image::{ImageFormat, ImageReader, Limits, RgbaImage};
 use rstar::{
