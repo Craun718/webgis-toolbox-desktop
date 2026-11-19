@@ -20,12 +20,14 @@ use webgis_toolbox::dom;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Raster,
+    Cog,
     Tiles(TileOp),
     Clip,
 }
 impl Tool {
     fn name(self) -> &'static str {
         match self {
+            Self::Cog => "生成 COG 云优化 GeoTIFF",
             Self::Raster => "OSGB 转 DOM / DSM",
             Self::Tiles(operation) => operation.name(),
             Self::Clip => "OSGB 模型裁剪",
@@ -36,6 +38,7 @@ impl Tool {
 pub struct App {
     selected: Tool,
     raster: RasterForm,
+    cog: CogForm,
     tiles: [TileForm; TileOp::ALL.len()],
     clip: ClipForm,
     worker: Option<Worker>,
@@ -148,6 +151,7 @@ impl App {
                 resolution: "0.05".into(),
                 ..Default::default()
             },
+            cog: CogForm::default(),
             tiles: Default::default(),
             clip: ClipForm::default(),
             worker: None,
@@ -205,6 +209,23 @@ impl App {
                             details: None,
                         })
                     }
+                })?
+            }
+            (Tool::Cog, Action::Run) => {
+                let input = required_path("源 GeoTIFF", &self.cog.input)?;
+                let output = required_path("输出 COG", &self.cog.output)?;
+                Worker::start(ctx, true, move |task| {
+                    let output = dom::cog::run(
+                        &input,
+                        &output,
+                        &task.cancelled,
+                        |event| task.update(event.stage, event.fraction),
+                        || task.publish(),
+                    )?;
+                    Ok(Outcome::Artifacts {
+                        paths: vec![output],
+                        details: None,
+                    })
                 })?
             }
             (Tool::Clip, Action::Layers) => {
@@ -284,6 +305,9 @@ impl eframe::App for App {
                         self.tool_link(ui, Tool::Clip);
                     });
                     ui.add_space(8.);
+                    ui.label(RichText::new("栅格处理").strong());
+                    ui.indent("raster_tools", |ui| self.tool_link(ui, Tool::Cog));
+                    ui.add_space(8.);
                     ui.label(RichText::new("瓦片处理").strong());
                     ui.indent("tile_tools", |ui| {
                         for operation in TileOp::ALL {
@@ -304,6 +328,7 @@ impl eframe::App for App {
                 ui.add_enabled_ui(!busy, |ui| {
                     match self.selected {
                         Tool::Raster => self.raster.ui(ui),
+                        Tool::Cog => self.cog.ui(ui),
                         Tool::Tiles(operation) => self.tiles[operation as usize].ui(ui, operation),
                         Tool::Clip => {
                             if self.clip.ui(ui) {
@@ -313,7 +338,8 @@ impl eframe::App for App {
                     }
                     ui.add_space(10.);
                     ui.horizontal(|ui| {
-                        if !matches!(self.selected, Tool::Tiles(_)) && ui.button("预检").clicked()
+                        if matches!(self.selected, Tool::Raster | Tool::Clip)
+                            && ui.button("预检").clicked()
                         {
                             action = Some(Action::Preview);
                         }
@@ -503,12 +529,50 @@ fn text_edit(ui: &mut Ui, value: &mut String, hint: &str) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum PathPicker {
+enum PathPicker<'a> {
     File(&'static str, &'static [&'static str]),
     FileOrFolder(&'static str, &'static [&'static str]),
     Folder,
     NewFolder,
-    SaveFile(&'static str, &'static [&'static str], &'static str),
+    SaveFile(&'static str, &'static [&'static str], &'a str),
+}
+
+#[derive(Default)]
+struct CogForm {
+    input: String,
+    output: String,
+}
+
+impl CogForm {
+    fn ui(&mut self, ui: &mut Ui) {
+        const EXTENSIONS: &[&str] = &["tif", "tiff"];
+        let changed = path_field(
+            ui,
+            "源 GeoTIFF",
+            &mut self.input,
+            "",
+            PathPicker::File("GeoTIFF", EXTENSIONS),
+        );
+        let default = dom::cog::default_output(Path::new(self.input.trim()));
+        if changed {
+            self.output = if self.input.trim().is_empty() {
+                String::new()
+            } else {
+                default.to_string_lossy().into_owned()
+            };
+        }
+        let default_name = default
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output_cog.tif");
+        path_field(
+            ui,
+            "输出 COG",
+            &mut self.output,
+            "",
+            PathPicker::SaveFile("GeoTIFF", EXTENSIONS, default_name),
+        );
+    }
 }
 
 fn path_field(
@@ -516,7 +580,7 @@ fn path_field(
     label: &str,
     value: &mut String,
     hint: &str,
-    picker: PathPicker,
+    picker: PathPicker<'_>,
 ) -> bool {
     ui.label(label);
     let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);

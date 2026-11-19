@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-WebGIS Toolbox is a Linux desktop application for converting OSGB models to DOM and DSM rasters, processing map tiles, and clipping OSGB models.
+WebGIS Toolbox is a Linux desktop application for converting OSGB models to DOM and DSM rasters, processing GeoTIFFs and map tiles, and clipping OSGB models.
 
 ## Build and run
 
@@ -18,6 +18,7 @@ The Chinese-language egui interface uses Glow and supports Wayland and X11. It l
 ## Tools
 
 - **OSGB to DOM and DSM.** Select a root OSGB file or the model’s `metadata.xml`. Selecting `metadata.xml` scans its directory and subdirectories for OSGB files. Preview the selected files, level of detail (LOD), coordinate mode, extent, and raster dimensions. For inputs that follow the ContextCapture LOD naming convention, the converter uses all tiles at the highest LOD in each model group. Relative-origin mode reads the coordinate reference system (CRS) and origin from `metadata.xml` and accepts manual overrides. Absolute mode uses model coordinates directly. Local mode produces rasters without a CRS. The default pixel size is 0.05 coordinate units.
+- **Raster processing → Generate Cloud Optimized GeoTIFF (COG).** Select one georeferenced `.tif` or `.tiff` and choose a save location. The default is `<source_stem>_cog.tif` beside the source. Supports stripped or tiled 8-bit grayscale, grayscale with alpha, RGB, RGBA, and single-band Float32 elevation GeoTIFFs. Output uses lossless DEFLATE, 256 × 256 BigTIFF tiles, and nearest-neighbor internal overviews. Original-resolution samples, alpha, internal masks, NoData, and georeferencing are preserved. The task can be cancelled before publication and requires a new output path.
 - **Tile processing.** Mosaic a single XYZ or TMS level into a GeoTIFF, generate a tile pyramid, or build a STACTA index. The STACTA tool writes the index into the source directory for XYZ inputs. For TMS inputs it converts tile row numbers to XYZ and writes the tiles and index to a new directory. The map tiling tool reprojects georeferenced 8-bit GeoTIFFs into 256 × 256 WebMercatorQuad PNG tiles and writes a STACTA index. The default zoom range is 6–18.
 - **OSGB model clipping.** Clip a single file or a paged model directory. Directory inputs read `metadata.xml` and accept an optional OSGB entry path. Single-file inputs require the model CRS and origin. Clipping boundaries can be SHP, zipped SHP, KML, or GeoJSON. If a ZIP contains multiple shapefiles, load the layer list and select the layer to use.
 

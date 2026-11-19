@@ -1,3 +1,4 @@
+pub mod cog;
 mod geotiff;
 pub mod map_tiles;
 mod raster;

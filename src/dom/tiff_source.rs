@@ -3,7 +3,12 @@ use super::{
     tiff_mask::{MAX_CHUNK, Mask, RawBlocks},
 };
 use anyhow::{Context, Result, ensure};
-use std::{collections::VecDeque, fs::File, io::BufReader, path::Path};
+use std::{
+    collections::{HashSet, VecDeque},
+    fs::File,
+    io::BufReader,
+    path::Path,
+};
 use tiff::{
     decoder::{Decoder, TiffCodingUnit},
     tags::{IfdPointer, Tag},
@@ -29,13 +34,13 @@ pub(super) struct Source {
     mask: Option<SourceMask>,
 }
 
-struct SourceMask {
+pub(super) struct SourceMask {
     tags: Mask,
     reader: BufReader<File>,
     cache: Cache,
 }
 
-struct WhiteAlpha {
+pub(super) struct WhiteAlpha {
     raw: RawBlocks,
     predictor: u16,
     tiled: bool,
@@ -43,7 +48,22 @@ struct WhiteAlpha {
 }
 
 impl WhiteAlpha {
-    fn read(
+    pub fn new(
+        tags: &mut tiff::decoder::IfdDecoder<'_>,
+        tiled: bool,
+        chunks_per_plane: usize,
+    ) -> Result<Self> {
+        let predictor = tags.find_tag_unsigned(Tag::Predictor)?.unwrap_or(1);
+        ensure!(matches!(predictor, 1 | 2), "不支持的灰度 Alpha TIFF 预测器");
+        Ok(Self {
+            raw: RawBlocks::new(tags, tiled)?,
+            predictor,
+            tiled,
+            chunks_per_plane,
+        })
+    }
+
+    pub fn read(
         &self,
         reader: &mut BufReader<File>,
         index: usize,
@@ -150,26 +170,15 @@ impl Source {
             .unwrap_or_default();
         // 通用解码器只能反转单波段 WhiteIsZero。双波段保留 Alpha，单独反转灰度。
         let white_alpha = if photo == 0 && samples == 2 {
-            let predictor = tags.find_tag_unsigned(Tag::Predictor)?.unwrap_or(1);
-            ensure!(matches!(predictor, 1 | 2), "不支持的灰度 Alpha TIFF 预测器");
-            Some(WhiteAlpha {
-                raw: RawBlocks::new(&mut tags, tiled)?,
-                predictor,
+            Some(WhiteAlpha::new(
+                &mut tags,
                 tiled,
-                chunks_per_plane: usize::try_from(expected_chunks)?,
-            })
+                usize::try_from(expected_chunks)?,
+            )?)
         } else {
             None
         };
-        let mask = find_mask(&mut decoder, size, sub_ifds)?
-            .map(|tags| -> Result<_> {
-                Ok(SourceMask {
-                    tags,
-                    reader: BufReader::new(File::open(path)?),
-                    cache: Cache::new(),
-                })
-            })
-            .transpose()?;
+        let mask = SourceMask::open(path, &mut decoder, size, sub_ifds, false)?;
         Ok(Self {
             size,
             crs,
@@ -288,7 +297,7 @@ impl Source {
     }
 }
 
-fn ifd_pointers(value: tiff::decoder::ifd::Value) -> Result<Vec<IfdPointer>> {
+pub(super) fn ifd_pointers(value: tiff::decoder::ifd::Value) -> Result<Vec<IfdPointer>> {
     Ok(value
         .into_u64_vec()?
         .into_iter()
@@ -301,40 +310,81 @@ fn find_mask(
     decoder: &mut Decoder<BufReader<File>>,
     size: [u32; 2],
     sub_ifds: Vec<IfdPointer>,
+    single_image: bool,
 ) -> Result<Option<Mask>> {
-    for pointer in sub_ifds {
+    let mut next = decoder.image_ifd().directory().next();
+    let mut seen = HashSet::new();
+    let mut mask = None;
+    let mut mask_pointer = None;
+    let mut sub_ifds = sub_ifds.into_iter();
+    loop {
+        let (pointer, linked) = if let Some(pointer) = sub_ifds.next() {
+            (pointer, false)
+        } else if let Some(pointer) = next.take() {
+            (pointer, true)
+        } else {
+            break;
+        };
+        if linked {
+            ensure!(seen.insert(pointer.0), "TIFF 的 IFD 链包含重复引用");
+        }
         let dir = decoder.read_directory(pointer)?;
+        if linked {
+            next = dir.next();
+        }
         let mut tags = decoder.read_directory_tags(&dir);
         let flags = tags
             .find_tag_unsigned::<u32>(Tag::NewSubfileType)?
             .unwrap_or(0);
-        if flags & 4 != 0
-            && tags.get_tag_u32(Tag::ImageWidth)? == size[0]
-            && tags.get_tag_u32(Tag::ImageLength)? == size[1]
-        {
-            return Ok(Some(Mask::read_tags(&mut tags)?));
+        if flags & 4 != 0 {
+            let same_size = tags.get_tag_u32(Tag::ImageWidth)? == size[0]
+                && tags.get_tag_u32(Tag::ImageLength)? == size[1];
+            if same_size && flags & 1 == 0 {
+                if mask_pointer == Some(pointer.0) {
+                    continue;
+                }
+                ensure!(mask.is_none(), "TIFF 包含多个原始分辨率掩膜");
+                mask = Some(Mask::read_tags(&mut tags)?);
+                mask_pointer = Some(pointer.0);
+                if !single_image {
+                    break;
+                }
+            } else {
+                ensure!(
+                    !single_image || flags & 1 != 0,
+                    "TIFF 原图与内部掩膜尺寸不一致"
+                );
+            }
+        } else if flags & 1 == 0 {
+            ensure!(!single_image, "不支持包含多个原始分辨率影像的 TIFF");
+            if linked {
+                break;
+            }
         }
     }
-    while decoder.more_images() {
-        decoder.next_image()?;
-        let flags = decoder
-            .find_tag_unsigned::<u32>(Tag::NewSubfileType)?
-            .unwrap_or(0);
-        if flags == 0 {
-            break;
-        }
-        if flags & 4 != 0 && decoder.dimensions()? == (size[0], size[1]) {
-            let mask = Mask::read_tags(&mut decoder.image_ifd())?;
-            decoder.seek_to_image(0)?;
-            return Ok(Some(mask));
-        }
-    }
-    decoder.seek_to_image(0)?;
-    Ok(None)
+    Ok(mask)
 }
 
 impl SourceMask {
-    fn valid(&mut self, x: u32, y: u32) -> Result<bool> {
+    pub fn open(
+        path: &Path,
+        decoder: &mut Decoder<BufReader<File>>,
+        size: [u32; 2],
+        sub_ifds: Vec<IfdPointer>,
+        single_image: bool,
+    ) -> Result<Option<Self>> {
+        find_mask(decoder, size, sub_ifds, single_image)?
+            .map(|tags| -> Result<_> {
+                Ok(Self {
+                    tags,
+                    reader: BufReader::new(File::open(path)?),
+                    cache: Cache::new(),
+                })
+            })
+            .transpose()
+    }
+
+    pub fn valid(&mut self, x: u32, y: u32) -> Result<bool> {
         let [cw, ch] = self.tags.chunk;
         let cols = self.tags.size[0].div_ceil(cw);
         let index = y / ch * cols + x / cw;
@@ -345,20 +395,20 @@ impl SourceMask {
     }
 }
 
-struct Cache {
+pub(super) struct Cache {
     entries: VecDeque<(u32, Vec<u8>)>,
     bytes: usize,
 }
 
 impl Cache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
         }
     }
 
-    fn get(&mut self, index: u32, load: impl FnOnce() -> Result<Vec<u8>>) -> Result<&[u8]> {
+    pub fn get(&mut self, index: u32, load: impl FnOnce() -> Result<Vec<u8>>) -> Result<&[u8]> {
         if let Some(position) = self.entries.iter().position(|(id, _)| *id == index) {
             if position != 0 {
                 let entry = self.entries.remove(position).unwrap();

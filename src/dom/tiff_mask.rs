@@ -142,10 +142,24 @@ impl RawBlocks {
             5 => {
                 let mut compressed = Vec::new();
                 input.read_to_end(&mut compressed)?;
-                let result = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
-                    .decode_bytes(&compressed, &mut data);
-                result.status?;
-                ensure!(result.consumed_out == size, "TIFF LZW 块大小无效");
+                let mut decoder =
+                    weezl::decode::Configuration::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+                        .with_yield_on_full_buffer(true)
+                        .build();
+                let mut src = compressed.as_slice();
+                let mut dst = data.as_mut_slice();
+                while !dst.is_empty() {
+                    let result = decoder.decode_bytes(src, dst);
+                    let status = result.status?;
+                    src = &src[result.consumed_in..];
+                    dst = &mut dst[result.consumed_out..];
+                    ensure!(
+                        dst.is_empty()
+                            || matches!(status, weezl::LzwStatus::Ok)
+                                && (result.consumed_in > 0 || result.consumed_out > 0),
+                        "TIFF LZW 块大小无效"
+                    );
+                }
             }
             _ => bail!("不支持的 TIFF 压缩"),
         }
