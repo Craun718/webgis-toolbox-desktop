@@ -196,6 +196,50 @@ fn accepts_root_osgb_and_rejects_other_model_inputs() {
 }
 
 #[test]
+fn follows_mixed_lod_pages_and_discards_embedded_coarse_geometry() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = request(temp.path());
+    let root = request.input.with_file_name("Block.osgb");
+    let low = root.with_file_name("tile_L8_0.osgb");
+    let high = root.with_file_name("tile_L9_0.osgb");
+    let leaf = fs::read(&high).unwrap();
+    fs::write(&low, &leaf).unwrap();
+
+    let mut lod = vec![0, 0, 0, 0, 0, 1];
+    append_u32(&mut lod, &[u32::MAX]);
+    lod.push(0);
+    append_u32(&mut lod, &[0]);
+    lod.push(0);
+    append_u32(&mut lod, &[0]);
+    lod.extend([0, 0]);
+    append_u32(&mut lod, &[0]);
+    lod.extend([0, 1]);
+    let mut names = Vec::new();
+    for name in ["", "tile_L8_0.osgb", "tile_L9_0.osgb"] {
+        string(&mut names, name);
+    }
+    append_u32(&mut lod, &[3]);
+    block(&mut lod, &names);
+    append_u32(&mut lod, &[3]);
+    block(&mut lod, &[0; 24]);
+    lod.push(1);
+    append_u32(&mut lod, &[1]);
+    block(&mut lod, &geometry(10, 100., Texture::File("coarse.jpg")));
+
+    let mut scene = leaf[..25].to_vec();
+    scene.extend(object("osg::PagedLOD", 1, &lod));
+    fs::write(&root, scene).unwrap();
+
+    for input in [request.input.clone(), root] {
+        request.input = input;
+        let summary = preflight(&request, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(summary.selected, [low.clone(), high.clone()]);
+        assert_eq!(summary.triangles, 4);
+        assert_eq!(summary.bounds, [112., 218., 23., 116., 222., 26.]);
+    }
+}
+
+#[test]
 fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let request = request(temp.path());

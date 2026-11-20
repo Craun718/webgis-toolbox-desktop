@@ -98,6 +98,20 @@ fn is_osgb(path: &Path) -> bool {
 }
 
 fn scan_osgb(directory: &Path, cancelled: &AtomicBool) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        check_cancelled(cancelled)?;
+        let entry = entry?;
+        if entry.file_name().eq_ignore_ascii_case("Block.osgb") && entry.path().is_file() {
+            roots.push(entry.path());
+        }
+    }
+    ensure!(roots.len() <= 1, "模型目录包含多个 Block.osgb 入口");
+    if !roots.is_empty() {
+        return Ok(roots);
+    }
+
+    // 无场景入口的数据仍按原有约定选择独立切片。
     let mut files = Vec::new();
     for entry in WalkDir::new(directory) {
         check_cancelled(cancelled)?;
@@ -273,7 +287,7 @@ fn prepare(
             };
             format!("{} 的坐标系无效", source.display())
         })?;
-    let mesh = Mesh::load(root, &selected, origin, cancelled, progress)?;
+    let (mesh, selected) = Mesh::load(root, selected, origin, cancelled, progress)?;
     let bounds = mesh.bounds;
     let [min_x, min_y, _, max_x, max_y, _] = bounds;
     ensure!(max_x > min_x && max_y > min_y, "模型没有有效的 XY 范围");

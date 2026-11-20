@@ -6,7 +6,7 @@ use rstar::{
     primitives::{GeomWithData, Rectangle},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Read, Seek, SeekFrom},
     ops::Range,
@@ -46,11 +46,11 @@ enum Source {
 impl Mesh {
     pub fn load(
         root: &Path,
-        files: &[PathBuf],
+        files: Vec<PathBuf>,
         origin: [f64; 3],
         cancelled: &AtomicBool,
         progress: &mut impl FnMut(Progress),
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<PathBuf>)> {
         let mut mesh = Self {
             bounds: [
                 f64::INFINITY,
@@ -64,20 +64,61 @@ impl Mesh {
             images: Vec::new(),
         };
         let mut external = HashMap::new();
-        for (i, file) in files.iter().enumerate() {
+        let mut pending: Vec<_> = files.into_iter().rev().map(|file| (file, false)).collect();
+        let mut active = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut selected = Vec::new();
+        while let Some((file, finished)) = pending.pop() {
             check_cancelled(cancelled)?;
+            if finished {
+                active.remove(&file);
+                visited.insert(file);
+                continue;
+            }
+            let file = file
+                .canonicalize()
+                .with_context(|| file.display().to_string())?;
+            ensure!(
+                file.starts_with(root),
+                "外部分页不在模型目录内：{}",
+                file.display()
+            );
+            if visited.contains(&file) {
+                continue;
+            }
+            ensure!(
+                active.insert(file.clone()),
+                "OSGB 分页存在循环引用：{}",
+                file.display()
+            );
             progress(Progress {
                 stage: format!("读取模型 {}", file.display()),
-                fraction: Some(i as f32 / files.len() as f32),
+                fraction: None,
             });
             let context = || file.display().to_string();
-            let bytes = fs::read(file).with_context(context)?;
-            let scene = osgb::raster_mesh(&bytes, cancelled)
+            let bytes = fs::read(&file).with_context(context)?;
+            let mut scene = osgb::raster_mesh(&bytes, cancelled)
                 .map_err(|err| anyhow!(err))
                 .with_context(context)?;
-            if files.len() == 1 && scene.triangles.is_empty() && !scene.pages.is_empty() {
-                anyhow::bail!("{} 仅包含外部分页，请选择模型目录", file.display());
+            pending.push((file.clone(), true));
+            for name in scene.pages.into_iter().rev() {
+                let path = Path::new(&name);
+                ensure!(
+                    !path.is_absolute() && !name.contains(':'),
+                    "不支持绝对分页路径 {name}"
+                );
+                pending.push((file.with_file_name(path), false));
             }
+            if scene.triangles.is_empty() {
+                continue;
+            }
+            selected.push(file.clone());
+            let used_textures: HashSet<_> = scene
+                .triangles
+                .iter()
+                .filter_map(|tri| tri.texture)
+                .collect();
+            scene.images.retain(|id, _| used_textures.contains(id));
             let mut ids = HashMap::new();
             let encoded_file = Arc::new(file.clone());
             for (id, source) in scene.images {
@@ -98,7 +139,7 @@ impl Mesh {
                         }
                     }
                     RasterImage::External(name) => {
-                        let path = texture_path(root, file, &name).with_context(context)?;
+                        let path = texture_path(root, &file, &name).with_context(context)?;
                         if let Some(&index) = external.get(&path) {
                             ids.insert(id, index);
                             continue;
@@ -148,7 +189,7 @@ impl Mesh {
             }
         }
         ensure!(!mesh.triangles.is_empty(), "所选模型中没有三角形");
-        Ok(mesh)
+        Ok((mesh, selected))
     }
 }
 

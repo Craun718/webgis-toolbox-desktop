@@ -112,6 +112,7 @@ fn read_scene<'a>(
         cancelled,
         raster,
         object_id: 0,
+        raster_coarse: false,
     };
     let result = reader.scene();
     result.map_err(|err| format!("OSGB 0x{:x}：{err}", reader.pos))?;
@@ -137,6 +138,7 @@ struct Reader<'a> {
     cancelled: Option<&'a AtomicBool>,
     raster: Option<RasterMesh>,
     object_id: u32,
+    raster_coarse: bool,
 }
 
 struct Array {
@@ -440,6 +442,7 @@ impl Reader<'_> {
 
     fn paged_children(&mut self, transform: Matrix) -> Result<(), String> {
         self.lod()?;
+        let mut has_external_page = false;
         let start = self.pos;
         if self.flag()? && self.flag()? {
             let path = self.string()?;
@@ -467,14 +470,22 @@ impl Reader<'_> {
                         return Err("不支持变换节点下的外部分页".into());
                     }
                     let relative = self.portable_reference(name, start..self.pos)?;
-                    self.pages.push(relative);
+                    has_external_page = true;
+                    if !self.raster_coarse {
+                        self.pages.push(relative);
+                    }
                 }
             }
             self.end()?;
             let count = self.u32()? as usize;
             self.fixed_block(count * 8)?;
         }
-        self.children(transform, true)
+        // 外部分页承载此分支的细节，内嵌子节点只是远景替代。
+        let inherited = self.raster_coarse;
+        self.raster_coarse |= self.raster.is_some() && has_external_page;
+        let result = self.children(transform, true);
+        self.raster_coarse = inherited;
+        result
     }
 
     fn fixed_block(&mut self, size: usize) -> Result<(), String> {
@@ -871,7 +882,9 @@ impl Reader<'_> {
                 if ids.iter().any(|&id| id >= vertex_count) {
                     return Err("索引超出顶点范围".into());
                 }
-                if let Some(mesh) = &mut self.raster {
+                if let Some(mesh) = &mut self.raster
+                    && !self.raster_coarse
+                {
                     let xyz = ids.map(|id| {
                         let v = &vertices.values[id * 3..id * 3 + 3];
                         std::array::from_fn(|axis| {
