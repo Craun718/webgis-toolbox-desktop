@@ -736,6 +736,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mosaic_option_controls_internal_overviews() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("tiles");
+        for x in 0..2 {
+            let column = input.join(format!("1/{x}"));
+            std::fs::create_dir_all(&column)?;
+            image::RgbaImage::from_pixel(256, 256, image::Rgba([x, 63, 127, 255]))
+                .save(column.join("0.png"))?;
+        }
+        for enabled in [false, true] {
+            let output = dir.path().join(format!("{enabled}.tif"));
+            let form = TileForm {
+                input: input.display().to_string(),
+                output: output.display().to_string(),
+                zoom: 1,
+                build_overviews: enabled,
+                ..Default::default()
+            };
+            let worker = Worker::start(&egui::Context::default(), "mosaic", false, move |task| {
+                form.run(TileOp::Mosaic, task, None)
+            })?;
+            worker.receiver.recv()??;
+            let mut decoder = tiff::decoder::Decoder::new(std::fs::File::open(output)?)?;
+            assert_eq!(decoder.dimensions()?, (512, 256));
+            assert_eq!(decoder.more_images(), enabled);
+            if enabled {
+                decoder.next_image()?;
+                assert_eq!(decoder.dimensions()?, (256, 128));
+                assert_eq!(decoder.get_tag_u32(tiff::tags::Tag::NewSubfileType)?, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn path_field_uses_one_control_row() {
         egui::__run_test_ui(|ui| {
             ui.allocate_ui(egui::vec2(500., 400.), |ui| {
@@ -1024,6 +1059,7 @@ impl TileOp {
 
 #[derive(Clone)]
 struct TileForm {
+    build_overviews: bool,
     input: String,
     scheme: Scheme,
     zoom: u8,
@@ -1041,6 +1077,7 @@ struct TileForm {
 impl Default for TileForm {
     fn default() -> Self {
         Self {
+            build_overviews: false,
             input: String::new(),
             scheme: Scheme::Xyz,
             zoom: 0,
@@ -1095,6 +1132,10 @@ impl TileForm {
                     &mut self.output,
                     message!(path_mosaic_tif),
                     PathPicker::SaveFile("GeoTIFF", &["tif", "tiff"], "mosaic.tif"),
+                );
+                ui.checkbox(
+                    &mut self.build_overviews,
+                    message!(generate_internal_pyramid),
                 );
             }
             TileOp::Pyramid => {
@@ -1231,13 +1272,30 @@ impl TileForm {
                     message!(mosaic_to_geotiff),
                     None,
                 ));
-                mosaic::run_with_publish(
-                    index.level(self.zoom)?,
-                    self.zoom,
-                    &output,
-                    pool,
-                    || task.publish(),
-                )?;
+                let level = index.level(self.zoom)?;
+                if self.build_overviews {
+                    anyhow::ensure!(
+                        !output.try_exists()?,
+                        message!(output_file_already_exists, output.display())
+                    );
+                    let parent = output
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    let scratch = tempfile::tempdir_in(parent)?;
+                    let base = scratch.path().join("mosaic.tif");
+                    mosaic::run_with_pool(level, self.zoom, &base, pool)?;
+                    dom::cog::run_with_progress(
+                        &base,
+                        &output,
+                        &task.cancelled,
+                        |event| task.update(event),
+                        || task.publish_with_progress(Some(0.95)),
+                        pool,
+                    )?;
+                } else {
+                    mosaic::run_with_publish(level, self.zoom, &output, pool, || task.publish())?;
+                }
                 output
             }
             TileOp::Pyramid => {

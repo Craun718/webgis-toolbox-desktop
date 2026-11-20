@@ -546,6 +546,9 @@ macro_rules! message {
     (rasterize_done_count_blocks, $($args:tt)+) => {
         $crate::localized_template!("栅格化 {done}/{count} 块", "Rasterize {done}/{count} blocks", "ラスター化 {done}/{count} ブロック"; $($args)+)
     };
+    (generate_internal_pyramid) => {
+        $crate::localized_template!("生成内置金字塔", "Generate internal overviews", "内部ピラミッドを生成")
+    };
     (build_internal_overviews) => {
         $crate::localized_template!("构建内部概览", "Build internal overviews", "内部オーバービューを作成")
     };
