@@ -327,9 +327,14 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
     let files = run(&request, &flag, |event| progress.push(event), || Ok(())).unwrap();
     let fractions: Vec<_> = progress
         .iter()
-        .map(|event| event.fraction.expect(&event.stage))
+        .filter_map(|event| event.fraction)
         .collect();
-    assert_eq!(fractions.first(), Some(&0.0));
+    assert_eq!(fractions.first(), Some(&0.20));
+    assert!(
+        progress.iter().any(|event| {
+            event.stage.starts_with("已读取 0 个模型") && event.fraction.is_none()
+        })
+    );
     assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(fractions.iter().all(|&fraction| fraction < 1.0));
     assert!(progress.iter().any(|event| event.stage == "构建三角形索引"));

@@ -343,7 +343,7 @@ pub fn run_with_pool(
 ) -> Result<Vec<PathBuf>> {
     // 模型读取占总进度的前 20%，预检仍使用自身的读取进度。
     let (summary, mesh, crs) = prepare(request, cancelled, &mut |mut event| {
-        event.fraction = Some(event.fraction.unwrap_or(0.0) * 0.20);
+        event.fraction = event.fraction.map(|fraction| fraction * 0.20);
         progress(event);
     })?;
     check_cancelled(cancelled)?;

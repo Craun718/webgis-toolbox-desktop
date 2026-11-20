@@ -1095,7 +1095,7 @@ impl TileForm {
             } else {
                 "扫描瓦片"
             },
-            (operation == TileOp::MapTiles).then_some(0.0),
+            None,
         );
         let output = match operation {
             TileOp::Mosaic => {

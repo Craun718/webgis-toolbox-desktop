@@ -284,8 +284,10 @@ fn converts_toolbox_dom_and_dsm_with_internal_mask_and_nodata() -> Result<()> {
             Some(&pool),
         )?;
         let progress = progress.into_inner();
+        assert_eq!(progress.first().unwrap().fraction, None);
         let fractions: Vec<_> = progress
             .iter()
+            .skip(1)
             .map(|event| event.fraction.expect(&event.stage))
             .collect();
         assert_eq!(fractions.first(), Some(&0.0));

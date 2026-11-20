@@ -68,6 +68,7 @@ impl Mesh {
         let mut active = HashSet::new();
         let mut visited = HashSet::new();
         let mut selected = Vec::new();
+        let mut read_count = 0;
         while let Some((file, finished)) = pending.pop() {
             check_cancelled(cancelled)?;
             if finished {
@@ -92,7 +93,7 @@ impl Mesh {
                 file.display()
             );
             progress(Progress {
-                stage: format!("读取模型 {}", file.display()),
+                stage: format!("已读取 {read_count} 个模型，正在读取 {}", file.display()),
                 fraction: None,
             });
             let context = || file.display().to_string();
@@ -100,6 +101,7 @@ impl Mesh {
             let mut scene = osgb::raster_mesh(&bytes, cancelled)
                 .map_err(|err| anyhow!(err))
                 .with_context(context)?;
+            read_count += 1;
             pending.push((file.clone(), true));
             for name in scene.pages.into_iter().rev() {
                 let path = Path::new(&name);
