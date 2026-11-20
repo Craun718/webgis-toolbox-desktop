@@ -107,7 +107,7 @@ fn cancellation_conflicts_and_invalid_input_leave_no_partial_output() {
     )
     .err()
     .unwrap();
-    assert!(error.contains("输出位置已存在"));
+    assert!(error.contains("输出位置已存在"), "{error}");
     assert_eq!(
         fs::read_to_string(request.output.join("existing.txt")).unwrap(),
         "existing content"
@@ -298,6 +298,24 @@ fn applies_matrix_transform_in_model_space() {
 
 #[test]
 fn preserves_relative_paging_and_reports_missing_tiles() {
+    const PRESSURE_CHILD: &str = "WEBGIS_TEST_CLIP_PRESSURE_CHILD";
+    if std::env::var_os(PRESSURE_CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "preserves_relative_paging_and_reports_missing_tiles",
+            ])
+            .env(PRESSURE_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let mut request = fixture(temp.path());
     let model = temp.path().join("model");
@@ -369,7 +387,28 @@ fn preserves_relative_paging_and_reports_missing_tiles() {
         .build()
         .unwrap();
     request.output = temp.path().join("parallel");
-    let parallel = run_with_pool(&request, &cancelled, |_| {}, || Ok(()), Some(&pool)).unwrap();
+    let mut widths = Vec::new();
+    let parallel = run_with_pool(
+        &request,
+        &cancelled,
+        |progress| {
+            if progress.concurrency != 0 {
+                widths.push(progress.concurrency);
+            } else if progress.completed == 1 && std::env::var_os(PRESSURE_CHILD).is_some() {
+                // Recover before the next batch. Future work must stay serial.
+                webgis_core::osgb_memory::set_pressure(true);
+                webgis_core::osgb_memory::set_pressure(false);
+            }
+        },
+        || Ok(()),
+        Some(&pool),
+    )
+    .unwrap();
+    if std::env::var_os(PRESSURE_CHILD).is_some() {
+        assert_eq!(widths, [1, 1, 1]);
+    } else {
+        assert_eq!(widths, [1, 2]);
+    }
     assert_eq!(
         (parallel.files, parallel.triangles),
         (report.files, report.triangles)

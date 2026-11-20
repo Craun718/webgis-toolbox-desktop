@@ -1,6 +1,9 @@
 //! OpenSceneGraph v131 robust binary scene serialization.
 
-use crate::message;
+use crate::{
+    message,
+    osgb_memory::{self as memory, BudgetError, Reservation},
+};
 
 use super::mesh::{Boundary, Weights, interpolate};
 use geo::Coord;
@@ -21,6 +24,7 @@ const IDENTITY: Matrix = [
 pub struct Scene {
     pub bytes: Vec<u8>,
     pub info: SceneInfo,
+    _memory: Reservation,
 }
 
 pub struct SceneInfo {
@@ -45,7 +49,16 @@ pub(super) fn rewrite_cancelable(
 ) -> Result<Scene, String> {
     let mut reader = parse(bytes, boundary, cancelled)?;
     reader.edits.sort_unstable_by_key(|(range, _)| range.start);
-    let mut output = Vec::new();
+    let output_bytes = reader
+        .edits
+        .iter()
+        .try_fold(bytes.len(), |size, (range, value)| {
+            size.checked_sub(range.len())?.checked_add(value.len())
+        })
+        .ok_or_else(|| message!(output_block_length_overflow).to_string())?;
+    let reservation = memory::reserve(output_bytes, message!(osgb_clip_page))
+        .map_err(|error| error.to_string())?;
+    let mut output = Vec::with_capacity(output_bytes);
     let mut pos = 0;
     for (range, value) in std::mem::take(&mut reader.edits) {
         output.extend_from_slice(&bytes[pos..range.start]);
@@ -56,13 +69,15 @@ pub(super) fn rewrite_cancelable(
     Ok(Scene {
         bytes: output,
         info: reader.info(),
+        _memory: reservation,
     })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RasterTriangle {
     pub xyz: [[f64; 3]; 3],
     pub uv: Option<[[f64; 2]; 3]>,
-    pub texture: Option<u32>,
+    pub texture: Option<usize>,
 }
 
 pub enum RasterImage {
@@ -78,9 +93,53 @@ pub struct RasterMesh {
     states: HashMap<u32, Option<u32>>,
     textures: HashMap<u32, u32>,
     active: Option<u32>,
+    triangle_memory: Option<Reservation>,
+    budget_failure: Option<BudgetError>,
 }
 
-pub fn raster_mesh(bytes: &[u8], cancelled: &AtomicBool) -> Result<RasterMesh, String> {
+impl RasterMesh {
+    fn reserve_triangles(&mut self, additional: usize) -> Result<(), String> {
+        let required = self.triangles.len().saturating_add(additional);
+        if required > self.triangles.capacity() {
+            let capacity = required.max(self.triangles.capacity().saturating_mul(2));
+            match memory::reserve(
+                capacity.saturating_mul(size_of::<RasterTriangle>()),
+                message!(osgb_raster_geometry),
+            ) {
+                Ok(reservation) => {
+                    self.triangles
+                        .reserve_exact(capacity - self.triangles.len());
+                    self.triangle_memory = Some(reservation);
+                }
+                Err(error) => {
+                    let description = error.to_string();
+                    self.budget_failure = Some(error);
+                    return Err(description);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum RasterError {
+    Parse(String),
+    Budget(BudgetError),
+}
+
+impl std::fmt::Display for RasterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(message) => f.write_str(message),
+            Self::Budget(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RasterError {}
+
+pub fn raster_mesh(bytes: &[u8], cancelled: &AtomicBool) -> Result<RasterMesh, RasterError> {
     let mut reader = read_scene(bytes, None, Some(cancelled), Some(RasterMesh::default()))?;
     let mut mesh = reader.raster.take().unwrap();
     mesh.pages = reader.pages;
@@ -92,7 +151,7 @@ fn parse<'a>(
     boundary: Option<&'a Boundary>,
     cancelled: Option<&'a AtomicBool>,
 ) -> Result<Reader<'a>, String> {
-    read_scene(bytes, boundary, cancelled, None)
+    read_scene(bytes, boundary, cancelled, None).map_err(|error| error.to_string())
 }
 
 fn read_scene<'a>(
@@ -100,7 +159,7 @@ fn read_scene<'a>(
     boundary: Option<&'a Boundary>,
     cancelled: Option<&'a AtomicBool>,
     raster: Option<RasterMesh>,
-) -> Result<Reader<'a>, String> {
+) -> Result<Reader<'a>, RasterError> {
     let mut reader = Reader {
         bytes,
         pos: 0,
@@ -115,9 +174,22 @@ fn read_scene<'a>(
         raster,
         object_id: 0,
         raster_coarse: false,
+        clip_allocations: Vec::new(),
     };
-    let result = reader.scene();
-    result.map_err(|err| message!(osgb_offset_error, reader.pos, err = err))?;
+    if let Err(err) = reader.scene() {
+        if let Some(error) = reader
+            .raster
+            .as_mut()
+            .and_then(|mesh| mesh.budget_failure.take())
+        {
+            return Err(RasterError::Budget(error));
+        }
+        return Err(RasterError::Parse(message!(
+            osgb_offset_error,
+            reader.pos,
+            err = err
+        )));
+    }
     Ok(reader)
 }
 
@@ -141,6 +213,7 @@ struct Reader<'a> {
     raster: Option<RasterMesh>,
     object_id: u32,
     raster_coarse: bool,
+    clip_allocations: Vec<Reservation>,
 }
 
 struct Array {
@@ -931,7 +1004,13 @@ impl Reader<'_> {
             return Err(message!(textured_mesh_is_missing_per_vertex_uv_coordinates).into());
         }
         let mut samples = Vec::new();
+        let mut sample_memory = None;
         for (range, header, indices) in primitives {
+            if let Some(mesh) = &mut self.raster
+                && !self.raster_coarse
+            {
+                mesh.reserve_triangles(indices.len() / 3)?;
+            }
             let first = samples.len();
             for (index, face) in indices.chunks_exact(3).enumerate() {
                 if index % 4096 == 0 {
@@ -964,7 +1043,7 @@ impl Reader<'_> {
                     mesh.triangles.push(RasterTriangle {
                         xyz,
                         uv,
-                        texture: mesh.active,
+                        texture: mesh.active.map(|id| id as usize),
                     });
                 }
                 if let Some(boundary) = self.boundary {
@@ -984,7 +1063,21 @@ impl Reader<'_> {
                     if xy.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
                         return Err(message!(transformed_model_coordinates_are_out_of_range).into());
                     }
-                    for clipped in boundary.clip(xy) {
+                    let clipped = boundary.clip(xy);
+                    let required = samples
+                        .len()
+                        .saturating_add(clipped.len().saturating_mul(3));
+                    if required > samples.capacity() {
+                        let capacity = required.max(samples.capacity().saturating_mul(2));
+                        let reservation = memory::reserve(
+                            capacity.saturating_mul(size_of::<([usize; 3], Weights)>()),
+                            message!(osgb_clip_page),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        samples.reserve_exact(capacity - samples.len());
+                        sample_memory = Some(reservation);
+                    }
+                    for clipped in clipped {
                         samples.extend(clipped.map(|weights| (ids, weights)));
                     }
                 }
@@ -999,8 +1092,13 @@ impl Reader<'_> {
                     self.edit_in(self.blocks.last().unwrap().start, range, Vec::new())?;
                     continue;
                 }
-                let mut primitive = Vec::new();
                 let class = b"osg::DrawElementsUInt";
+                let capacity = 16 + class.len() + header.len() + ((last - first) as usize) * 4;
+                self.clip_allocations.push(
+                    memory::reserve(capacity, message!(osgb_clip_page))
+                        .map_err(|error| error.to_string())?,
+                );
+                let mut primitive = Vec::with_capacity(capacity);
                 push_u32(&mut primitive, class.len() as u32);
                 primitive.extend_from_slice(class);
                 let size = i32::try_from(4usize + header.len() + 4 + ((last - first) as usize) * 4)
@@ -1032,6 +1130,7 @@ impl Reader<'_> {
                 }
             }
         }
+        drop(sample_memory);
         Ok(())
     }
 
@@ -1042,7 +1141,12 @@ impl Reader<'_> {
         samples: &[([usize; 3], Weights)],
         normal: bool,
     ) -> Result<(), String> {
-        let mut replacement = Vec::new();
+        let capacity = 4 + samples.len() * array.width * array.scalar;
+        self.clip_allocations.push(
+            memory::reserve(capacity, message!(osgb_clip_page))
+                .map_err(|error| error.to_string())?,
+        );
+        let mut replacement = Vec::with_capacity(capacity);
         push_u32(&mut replacement, samples.len() as u32);
         for (index, &(ids, weights)) in samples.iter().enumerate() {
             if index % 4096 == 0 {

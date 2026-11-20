@@ -1,6 +1,8 @@
 use super::{Boundary, Reference, osgb, vector};
-use crate::message;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::osgb_output::OutputLock;
 use crate::task_pool::{self, ThreadPool};
+use crate::{message, osgb_memory as memory};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
@@ -9,7 +11,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
     pub model: PathBuf,
@@ -23,7 +25,7 @@ pub struct Request {
     pub allow_non_empty_output: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Preflight {
     pub reference: Reference,
     pub entries: Vec<PathBuf>,
@@ -35,9 +37,10 @@ pub struct Progress {
     pub completed: usize,
     pub discovered: usize,
     pub file: PathBuf,
+    pub concurrency: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Report {
     pub output: PathBuf,
     pub entries: Vec<PathBuf>,
@@ -97,23 +100,87 @@ pub fn run_with_pool(
     before_publish: impl FnOnce() -> Result<(), String>,
     pool: Option<&ThreadPool>,
 ) -> Result<Report, String> {
+    let staged = StagedClip::new(request)?;
+    let report = compute_staged(request, staged.path(), cancelled, &mut progress, pool)?;
+    check_cancelled(cancelled)?;
+    before_publish()?;
+    staged.publish(request.allow_non_empty_output)?;
+    Ok(report)
+}
+
+pub struct StagedClip {
+    output: PathBuf,
+    existing: Option<bool>,
+    staging: tempfile::TempDir,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _locks: Vec<OutputLock>,
+}
+
+impl StagedClip {
+    pub fn new(request: &Request) -> Result<Self, String> {
+        let output = output_path(&request.output)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut locks = {
+            let parent = output.parent().unwrap();
+            vec![OutputLock::acquire(parent).map_err(|err| file_error(parent, err))?]
+        };
+        let existing = output_non_empty(&output)?;
+        if existing == Some(true) && !request.allow_non_empty_output {
+            return Err(message!(the_output_folder_is_not_empty_confirm_before_clipping).into());
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if existing.is_some() {
+            locks.push(OutputLock::acquire(&output).map_err(|err| file_error(&output, err))?);
+        }
+        let staging = tempfile::Builder::new()
+            .prefix(".osgb-clip-")
+            .tempdir_in(if existing.is_some() {
+                output.as_path()
+            } else {
+                output.parent().unwrap()
+            })
+            .map_err(|err| io_error(&output, err))?;
+        Ok(Self {
+            output,
+            existing,
+            staging,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            _locks: locks,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.staging.path()
+    }
+
+    pub fn publish(self, allow_non_empty: bool) -> Result<(), String> {
+        let output = &self.output;
+        let stage = self.path();
+        if self.existing.is_some() {
+            let non_empty = directory_has_entries(output, Some(stage))?;
+            if non_empty && !allow_non_empty {
+                return Err(
+                    message!(the_output_folder_is_not_empty_confirm_before_clipping).into(),
+                );
+            }
+            publish_into_existing(stage, output)?;
+        } else {
+            publish(stage, output).map_err(|err| output_error(output, err))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn compute_staged(
+    request: &Request,
+    stage: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+    pool: Option<&ThreadPool>,
+) -> Result<Report, String> {
     check_cancelled(cancelled)?;
     let prepared = prepare(request)?;
-    check_cancelled(cancelled)?;
     let output = &prepared.summary.output;
-    let existing = output_non_empty(output)?;
-    if existing == Some(true) && !request.allow_non_empty_output {
-        return Err(message!(the_output_folder_is_not_empty_confirm_before_clipping).into());
-    }
-    let staging = tempfile::Builder::new()
-        .prefix(".osgb-clip-")
-        .tempdir_in(if existing.is_some() {
-            output.as_path()
-        } else {
-            output.parent().unwrap()
-        })
-        .map_err(|err| file_error(output, err))?;
-    let stage = staging.path();
     let mut pending: VecDeque<_> = prepared.summary.entries.iter().cloned().collect();
     let mut seen: HashSet<_> = pending.iter().cloned().collect();
     let mut textures = HashSet::new();
@@ -124,19 +191,38 @@ pub fn run_with_pool(
     }
     write_file(&stage.join("metadata.xml"), &prepared.metadata)?;
     while !pending.is_empty() {
-        let batch: Vec<_> = pending
-            .drain(..pending.len().min(task_pool::width(pool)))
-            .collect();
-        check_cancelled(cancelled)?;
+        memory::wait(cancelled)?;
+        let mut batch = Vec::new();
+        let mut estimated = 0_usize;
+        let soft_limit = memory::available_budget() / 2;
+        for _ in 0..memory::width(task_pool::width(pool)) {
+            let Some(relative) = pending.front() else {
+                break;
+            };
+            let file = ensure_input(&prepared.root, relative)?;
+            let estimate = memory::page_bytes(&file).map_err(|err| file_error(&file, err))?;
+            if !batch.is_empty() && estimated.saturating_add(estimate) > soft_limit {
+                break;
+            }
+            match memory::reserve(estimate, file.display()) {
+                Ok(reservation) => {
+                    estimated = estimated.saturating_add(estimate);
+                    batch.push((pending.pop_front().unwrap(), file, reservation));
+                }
+
+                Err(_) if !batch.is_empty() => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         progress(Progress {
             completed,
             discovered: seen.len(),
-            file: batch[0].clone(),
+            file: batch[0].0.clone(),
+            concurrency: batch.len(),
         });
-        let models = task_pool::map(pool, batch, |relative| {
+        let models = task_pool::map(pool, batch, |(relative, file, reservation)| {
             check_cancelled(cancelled)?;
-            let file = ensure_input(&prepared.root, &relative)?;
-            let input = fs::read(&file).map_err(|err| file_error(&file, err))?;
+            let input = memory::read_page(&file).map_err(|err| file_error(&file, err))?;
             let clipped =
                 osgb::rewrite_cancelable(&input, Some(&prepared.boundary), Some(cancelled))
                     .map_err(|err| message!(clip_osgb_failed, file_error(&file, err)))?;
@@ -148,9 +234,9 @@ pub fn run_with_pool(
             {
                 return Err(message!(output_validation_failed, file.display()));
             }
-            Ok((relative, file, clipped))
+            Ok((relative, file, clipped, reservation))
         })?;
-        for (relative, file, clipped) in models {
+        for (relative, file, clipped, _reservation) in models {
             check_cancelled(cancelled)?;
             if prepared.single && !clipped.info.pages.is_empty() {
                 return Err(message!(
@@ -193,9 +279,8 @@ pub fn run_with_pool(
                         .create_new(true)
                         .write(true)
                         .open(&target)
-                        .map_err(|err| file_error(&target, err))?;
-                    if io::copy(&mut input, &mut out).map_err(|err| file_error(&target, err))? == 0
-                    {
+                        .map_err(|err| io_error(&target, err))?;
+                    if io::copy(&mut input, &mut out).map_err(|err| io_error(&target, err))? == 0 {
                         return Err(message!(texture_file_is_empty, source.display()));
                     }
                 }
@@ -207,22 +292,13 @@ pub fn run_with_pool(
                 completed,
                 discovered: seen.len(),
                 file: relative,
+                concurrency: 0,
             });
         }
     }
     check_cancelled(cancelled)?;
     if triangles == 0 {
         return Err(message!(the_model_does_not_intersect_the_clip_boundary).into());
-    }
-    before_publish()?;
-    if existing.is_some() {
-        let non_empty = directory_has_entries(output, Some(stage))?;
-        if non_empty && !request.allow_non_empty_output {
-            return Err(message!(the_output_folder_is_not_empty_confirm_before_clipping).into());
-        }
-        publish_into_existing(stage, output)?;
-    } else {
-        publish(stage, output).map_err(|err| output_error(output, err))?;
     }
     Ok(Report {
         output: output.clone(),
@@ -534,7 +610,7 @@ fn ensure_input(root: &Path, relative: &Path) -> Result<PathBuf, String> {
 }
 
 fn real_path(path: &Path) -> Result<PathBuf, String> {
-    fs::canonicalize(path).map_err(|err| file_error(path, err))
+    fs::canonicalize(path).map_err(|err| io_error(path, err))
 }
 
 fn read_scene(
@@ -543,14 +619,18 @@ fn read_scene(
     cancelled: &AtomicBool,
 ) -> Result<(PathBuf, osgb::SceneInfo), String> {
     let file = ensure_input(root, entry)?;
-    let bytes = fs::read(&file).map_err(|err| file_error(&file, err))?;
+    memory::wait(cancelled)?;
+    let estimate = memory::page_bytes(&file).map_err(|err| file_error(&file, err))?;
+    let _reservation =
+        memory::reserve(estimate, file.display()).map_err(|error| error.to_string())?;
+    let bytes = memory::read_page(&file).map_err(|err| file_error(&file, err))?;
     let scene = osgb::inspect(&bytes, Some(cancelled))
         .map_err(|err| message!(read_osgb_failed, file_error(&file, err)))?;
     Ok((file, scene))
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path.parent().unwrap()).map_err(|err| file_error(path, err))
+    fs::create_dir_all(path.parent().unwrap()).map_err(|err| io_error(path, err))
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -560,8 +640,15 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .create_new(true)
         .write(true)
         .open(path)
-        .map_err(|err| file_error(path, err))?;
-    file.write_all(bytes).map_err(|err| file_error(path, err))
+        .map_err(|err| io_error(path, err))?;
+    file.write_all(bytes).map_err(|err| io_error(path, err))
+}
+
+fn io_error(path: &Path, err: io::Error) -> String {
+    if err.kind() == io::ErrorKind::StorageFull {
+        return format!("{}\n{}", message!(osgb_disk_full), file_error(path, err));
+    }
+    file_error(path, err)
 }
 
 fn file_error(path: &Path, err: impl std::fmt::Display) -> String {

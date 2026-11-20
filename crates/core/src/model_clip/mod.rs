@@ -13,5 +13,6 @@ pub use crs::Reference;
 
 mod job;
 pub use job::{
-    Preflight, Progress, Report, Request, preflight, preflight_cancelable, run, run_with_pool,
+    Preflight, Progress, Report, Request, StagedClip, compute_staged, preflight,
+    preflight_cancelable, run, run_with_pool,
 };
