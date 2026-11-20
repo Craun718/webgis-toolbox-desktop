@@ -7,6 +7,7 @@ use webgis_toolbox::dom::{self, Phase, TaskProgress};
 mod file_dialog;
 mod settings;
 mod task;
+mod terrain;
 
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, Context as EguiContext, RichText, Ui};
@@ -28,6 +29,7 @@ use webgis_core::{model_clip as clip, task_pool::ThreadPool};
 enum Tool {
     Raster,
     Cog,
+    Terrain,
     Tiles(TileOp),
     Clip,
     Settings,
@@ -36,6 +38,7 @@ impl Tool {
     fn name(self) -> &'static str {
         match self {
             Self::Cog => message!(create_cloud_optimized_geotiff),
+            Self::Terrain => message!(generate_terrain_tiles),
             Self::Raster => message!(osgb_to_dom_dsm),
             Self::Tiles(operation) => operation.name(),
             Self::Clip => message!(clip_osgb_models),
@@ -48,6 +51,7 @@ pub struct App {
     selected: Tool,
     raster: RasterForm,
     cog: CogForm,
+    terrain: terrain::Form,
     tiles: [TileForm; TileOp::ALL.len()],
     clip: ClipForm,
     worker: Option<Worker>,
@@ -84,6 +88,7 @@ impl App {
                 ..Default::default()
             },
             cog: CogForm::default(),
+            terrain: terrain::Form::default(),
             tiles: Default::default(),
             clip: ClipForm::default(),
             worker: None,
@@ -167,6 +172,7 @@ impl App {
                     }
                 })?
             }
+            (Tool::Terrain, Action::Run) => self.terrain.start(ctx, &name)?,
             (Tool::Cog, Action::Run) => {
                 let input = required_path(message!(source_geotiff), &self.cog.input)?;
                 let output = required_path(message!(output_cog), &self.cog.output)?;
@@ -307,6 +313,7 @@ impl App {
                     ui.label(RichText::new(message!(raster_tools)).strong());
                     ui.indent("raster_tools", |ui| {
                         self.tool_link(ui, Tool::Cog);
+                        self.tool_link(ui, Tool::Terrain);
                     });
                     ui.add_space(8.);
                     ui.label(RichText::new(message!(tile_tools)).strong());
@@ -360,6 +367,7 @@ impl App {
                     match self.selected {
                         Tool::Raster => self.raster.ui(ui),
                         Tool::Cog => self.cog.ui(ui),
+                        Tool::Terrain => self.terrain.ui(ui),
                         Tool::Tiles(operation) => self.tiles[operation as usize].ui(ui, operation),
                         Tool::Clip => {
                             if self.clip.ui(ui) {

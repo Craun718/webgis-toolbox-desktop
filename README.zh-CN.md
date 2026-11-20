@@ -4,7 +4,10 @@
 
 Linux 上的中文 egui 桌面应用，支持 OSGB 转 DOM / DSM、栅格处理、瓦片处理和 OSGB 模型裁剪。
 
+克隆仓库后初始化固定版本的 `ctb-rs` 子模块。常规构建可跳过 Git LFS 样例栅格下载。
+
 ```sh
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
 cargo build --locked
 ./target/debug/webgis-toolbox
 ```
@@ -13,6 +16,7 @@ cargo build --locked
 
 - **OSGB 转 DOM / DSM** 的模型输入可选择根 OSGB 文件或 `metadata.xml`。选择 `metadata.xml` 时优先从同目录的 `Block.osgb` 进入。转换器沿 PagedLOD 引用遍历场景树，保留各分支的叶节点几何，支持分支在不同 LOD 终止。无 `Block.osgb` 的目录会递归扫描文件，对符合 ContextCapture 命名约定的分片按模型组选最高 LOD。支持预检所选文件、LOD、坐标模式、范围和栅格尺寸。相对原点模式从 `metadata.xml` 读取坐标系及原点，支持手动覆盖。绝对坐标模式直接使用模型坐标，本地模式生成无 CRS 的栅格。默认像元尺寸为 0.05 个坐标单位。
 - **栅格处理 → 生成 COG 云优化 GeoTIFF**。每次选择一个内嵌地理参考的 `.tif` 或 `.tiff`，然后指定保存位置，默认在源文件同目录生成 `<源文件名>_cog.tif`。支持条带或分块存储的 8 位灰度、灰度加 Alpha、RGB、RGBA 和单波段 Float32 高程 GeoTIFF。输出为 256 × 256 分块、无损 DEFLATE 压缩的 BigTIFF，内部概览采用最近邻抽样。保留原始分辨率的像元、Alpha、内部掩膜、NoData 和地理参考。任务可在发布前取消，输出须指定新文件路径。
+- **栅格处理 → 生成地形瓦片**。选择单波段、北向上的 GeoTIFF 或 VRT DEM，并指定一个新目录。默认使用 Geodetic（EPSG:4326），也可选择 Mercator（EPSG:3857）。最低缩放级别留空时从 0 开始，最高缩放级别留空时根据源数据分辨率推导。后台任务显示已完成与总瓦片数，运行至成功或报错。输出为 `{z}/{x}/{y}.terrain` 格式的 TMS heightmap-1.0 瓦片。`layer.json`、quantized-mesh 和瓦片发布服务留待后续集成。
 - **瓦片处理**支持 XYZ / TMS 单级拼接、生成多级瓦片（基于一个源级别生成指定级别）和生成 STACTA，也可将带坐标系的 8 位 GeoTIFF 重投影为 256×256 WebMercatorQuad PNG 切片（默认 6–18 级）并生成 STACTA。从已有 XYZ 瓦片生成索引时，索引写到瓦片源目录。TMS 会将瓦片转换为 XYZ 行号后写入新目录，并生成索引。
 - **OSGB 模型裁剪**支持单文件和分页目录，可为目录指定入口路径。目录模式读取模型的 `metadata.xml`，单文件模式需填写坐标系和原点。裁剪范围支持 SHP、ZIP 内 SHP、KML 和 GeoJSON。ZIP 含多个 SHP 时先读取图层列表，再选择一个图层。
 

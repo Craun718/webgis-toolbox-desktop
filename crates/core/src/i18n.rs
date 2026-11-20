@@ -114,6 +114,36 @@ macro_rules! message {
     (process) => {
         $crate::localized_template!("处理", "Process", "処理")
     };
+    (generate_terrain_tiles) => {
+        $crate::localized_template!("生成地形瓦片", "Generate Terrain Tiles", "地形タイルの生成")
+    };
+    (terrain_dem) => {
+        $crate::localized_template!("高程 DEM", "Elevation DEM", "標高 DEM")
+    };
+    (single_band_geotiff_or_vrt) => {
+        $crate::localized_template!("单波段 GeoTIFF 或 VRT", "Single-band GeoTIFF or VRT", "単バンドの GeoTIFF または VRT")
+    };
+    (terrain_profile) => {
+        $crate::localized_template!("切片坐标系", "Tile coordinate system", "タイル座標系")
+    };
+    (terrain_min_zoom) => {
+        $crate::localized_template!("最低缩放级别", "Minimum zoom", "最小ズームレベル")
+    };
+    (terrain_max_zoom) => {
+        $crate::localized_template!("最高缩放级别", "Maximum zoom", "最大ズームレベル")
+    };
+    (zoom_from_source_resolution) => {
+        $crate::localized_template!("根据源分辨率推导", "Derived from source resolution", "入力データの解像度から算出")
+    };
+    (terrain_output_description) => {
+        $crate::localized_template!("输出 TMS heightmap-1.0 瓦片（{z}/{x}/{y}.terrain）。", "Writes TMS heightmap-1.0 tiles ({z}/{x}/{y}.terrain).", "TMS heightmap-1.0 タイル（{z}/{x}/{y}.terrain）を出力します。")
+    };
+    (terrain_tile_progress, $($args:tt)+) => {
+        $crate::localized_template!("已生成 {} / {} 个地形瓦片", "Terrain tiles generated: {} / {}", "地形タイル生成済み {} / {}"; $($args)+)
+    };
+    (invalid_terrain_zoom, $($args:tt)+) => {
+        $crate::localized_template!("{}必须是 0 到 255 的整数", "{} must be an integer from 0 to 255", "{}は 0 〜 255 の整数で指定してください"; $($args)+)
+    };
     (source_geotiff) => {
         $crate::localized_template!("源 GeoTIFF", "Source GeoTIFF", "入力 GeoTIFF")
     };

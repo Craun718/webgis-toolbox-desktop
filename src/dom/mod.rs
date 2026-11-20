@@ -95,6 +95,7 @@ pub enum Phase {
     Pyramid,
     CreateStacta,
     GenerateTiles,
+    GenerateTerrain,
     IndexTiles,
     Publish,
 }
