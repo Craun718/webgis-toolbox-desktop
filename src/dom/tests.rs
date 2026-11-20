@@ -272,7 +272,17 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
     let mut request = request(temp.path());
     request.crs = Some(r#"PROJCRS["CGCS2000",ID["EPSG",4547]]"#.into());
     let flag = AtomicBool::new(false);
-    let files = run(&request, &flag, |_| {}, || Ok(())).unwrap();
+    let mut progress = Vec::new();
+    let files = run(&request, &flag, |event| progress.push(event), || Ok(())).unwrap();
+    let fractions: Vec<_> = progress
+        .iter()
+        .map(|event| event.fraction.expect(&event.stage))
+        .collect();
+    assert_eq!(fractions.first(), Some(&0.0));
+    assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(fractions.iter().all(|&fraction| fraction < 1.0));
+    assert!(progress.iter().any(|event| event.stage == "构建三角形索引"));
+    assert!(progress.iter().any(|event| event.stage == "校验写出结果"));
     assert_eq!(files.len(), PRODUCTS.len());
     let original: Vec<_> = files.iter().map(|p| fs::read(p).unwrap()).collect();
     assert_eq!(&original[0][..4], b"II+\0");

@@ -161,6 +161,10 @@ pub(super) fn write(
             }
         }
     }
+    progress(Progress {
+        stage: "刷新 COG 写入缓冲区".into(),
+        fraction: Some(0.90),
+    });
     out.flush()?;
     Ok(())
 }
@@ -172,7 +176,7 @@ fn update(progress: &impl Fn(Progress), number: usize, completed: u64, total: u6
         } else {
             format!("写入 {} 倍概览", 1_u32 << number)
         },
-        fraction: Some(completed as f32 / total as f32),
+        fraction: Some(0.90 * (completed as f32 / total as f32)),
     });
 }
 

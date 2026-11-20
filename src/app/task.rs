@@ -128,11 +128,15 @@ impl TaskContext {
     }
 
     pub(super) fn publish(&self) -> Result<()> {
+        self.publish_with_progress(None)
+    }
+
+    pub(super) fn publish_with_progress(&self, fraction: Option<f32>) -> Result<()> {
         let mut state = self.control.state.lock().unwrap();
         ensure!(!self.cancelled.load(Ordering::Relaxed), "处理已取消");
         state.stage = Stage {
             name: "发布结果".into(),
-            fraction: None,
+            fraction,
             publishing: true,
         };
         state.log("INFO", "发布结果");
@@ -402,7 +406,7 @@ mod tests {
         let (published, ready) = mpsc::channel();
         let (release, wait) = mpsc::channel();
         let worker = Worker::start(&egui::Context::default(), "处理", true, move |task| {
-            task.publish()?;
+            task.publish_with_progress(Some(0.95))?;
             published.send(())?;
             wait.recv_timeout(Duration::from_secs(5))?;
             Ok(Outcome::Artifacts {
@@ -416,6 +420,7 @@ mod tests {
         {
             let mut state = worker.control.state.lock().unwrap();
             assert!(state.stage.publishing);
+            assert_eq!(state.stage.fraction, Some(0.95));
             assert!(state.logs[1].ends_with("发布结果"));
             state.request_cancel(&worker.control);
             assert!(!worker.control.cancelled.load(Ordering::Relaxed));

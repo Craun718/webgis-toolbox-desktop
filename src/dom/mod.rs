@@ -318,7 +318,11 @@ pub fn run_with_pool(
     before_publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<PathBuf>> {
-    let (summary, mesh, crs) = prepare(request, cancelled, &mut progress)?;
+    // 模型读取占总进度的前 20%，预检仍使用自身的读取进度。
+    let (summary, mesh, crs) = prepare(request, cancelled, &mut |mut event| {
+        event.fraction = Some(event.fraction.unwrap_or(0.0) * 0.20);
+        progress(event);
+    })?;
     check_cancelled(cancelled)?;
     fs::create_dir_all(&request.output)?;
     let output = request.output.canonicalize()?;
@@ -345,12 +349,20 @@ pub fn run_with_pool(
     let mut dom_file = BigTiff::new_big(fs::File::create(&dom_path)?)?;
     let mut dsm = LevelWriter::new(&mut dsm_file, RasterKind::Dsm)?;
     let mut dom = LevelWriter::new(&mut dom_file, RasterKind::Dom)?;
+    progress(Progress {
+        stage: "构建三角形索引".into(),
+        fraction: Some(0.20),
+    });
     let index = raster::index(&mesh.triangles);
     let mut textures: Vec<_> = (0..task_pool::width(pool))
         .map(|_| TextureCache::new(&mesh.images))
         .collect();
     let (w, h) = (width as usize, height as usize);
     let count = w.div_ceil(TILE) as u64 * h.div_ceil(TILE) as u64;
+    progress(Progress {
+        stage: format!("栅格化 0/{count} 块"),
+        fraction: Some(0.50),
+    });
     let mut done = 0_u64;
     let mut dsm_valid_pixels = 0_u64;
     let mut dom_valid_pixels = 0_u64;
@@ -375,7 +387,7 @@ pub fn run_with_pool(
             done += 1;
             progress(Progress {
                 stage: format!("栅格化 {done}/{count} 块"),
-                fraction: Some(done as f32 / count as f32),
+                fraction: Some(0.50 + 0.30 * (done as f32 / count as f32)),
             });
         }
     }
@@ -397,7 +409,7 @@ pub fn run_with_pool(
         .collect();
     progress(Progress {
         stage: "构建内部概览".into(),
-        fraction: None,
+        fraction: Some(0.80),
     });
     tiff_output::overviews(
         &mut dsm_file,
@@ -420,7 +432,7 @@ pub fn run_with_pool(
     drop((dsm_file, dom_file));
     progress(Progress {
         stage: "校验写出结果".into(),
-        fraction: None,
+        fraction: Some(0.90),
     });
     for (path, kind, valid) in [
         (&dsm_path, RasterKind::Dsm, dsm_valid_pixels),

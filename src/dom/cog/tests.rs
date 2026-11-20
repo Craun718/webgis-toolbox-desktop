@@ -274,14 +274,24 @@ fn converts_toolbox_dom_and_dsm_with_internal_mask_and_nodata() -> Result<()> {
         dom_dsm(&input, kind)?;
         let output = convert(&input)?;
         let parallel = root.path().join(format!("parallel-{name}"));
+        let progress = std::cell::RefCell::new(Vec::new());
         run_with_pool(
             &input,
             &parallel,
             &AtomicBool::new(false),
-            |_| {},
+            |event| progress.borrow_mut().push(event),
             || Ok(()),
             Some(&pool),
         )?;
+        let progress = progress.into_inner();
+        let fractions: Vec<_> = progress
+            .iter()
+            .map(|event| event.fraction.expect(&event.stage))
+            .collect();
+        assert_eq!(fractions.first(), Some(&0.0));
+        assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(fractions.iter().all(|&fraction| fraction < 1.0));
+        assert_eq!(progress.last().unwrap().stage, "刷新 COG 写入缓冲区");
         assert_eq!(fs::read(&parallel)?, fs::read(&output)?);
         compare_full_resolution(&input, &output)?;
         check_layout(&output, SIZE, flags)?;

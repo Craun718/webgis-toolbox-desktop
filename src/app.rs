@@ -150,7 +150,7 @@ impl App {
                                 &request,
                                 &task.cancelled,
                                 update,
-                                || task.publish(),
+                                || task.publish_with_progress(Some(0.95)),
                                 pool.as_ref(),
                             )?,
                             details: None,
@@ -168,7 +168,7 @@ impl App {
                         &output,
                         &task.cancelled,
                         |event| task.update(event.stage, event.fraction),
-                        || task.publish(),
+                        || task.publish_with_progress(Some(0.95)),
                         pool.as_ref(),
                     )?;
                     Ok(Outcome::Artifacts {
@@ -200,8 +200,13 @@ impl App {
                         &task.cancelled,
                         |p| {
                             task.update(
-                                format!("裁剪 {}", p.file.display()),
-                                Some(p.completed as f32 / p.discovered as f32),
+                                format!(
+                                    "裁剪 {}（已处理 {} / 已发现 {} 个模型）",
+                                    p.file.display(),
+                                    p.completed,
+                                    p.discovered,
+                                ),
+                                None,
                             );
                         },
                         || task.publish().map_err(|err| err.to_string()),
@@ -1090,7 +1095,7 @@ impl TileForm {
             } else {
                 "扫描瓦片"
             },
-            None,
+            (operation == TileOp::MapTiles).then_some(0.0),
         );
         let output = match operation {
             TileOp::Mosaic => {
@@ -1167,7 +1172,7 @@ impl TileForm {
                     &request,
                     &task.cancelled,
                     |stage, fraction| task.update(stage, fraction),
-                    || task.publish(),
+                    || task.publish_with_progress(Some(0.95)),
                     pool,
                 )?;
                 let missing: Vec<_> = (self.min_zoom..=self.max_zoom)

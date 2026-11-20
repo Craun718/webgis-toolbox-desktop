@@ -608,7 +608,24 @@ fn parallel_sampling_preserves_tiles_and_index_with_overlapping_candidate_ranges
     request.max_zoom = 3;
     request.id = Some("test".into());
     let cancelled = AtomicBool::new(false);
-    let serial = run(&request, &cancelled, |_, _| {}, || Ok(()))?;
+    let mut progress = Vec::new();
+    let serial = run(
+        &request,
+        &cancelled,
+        |stage, fraction| progress.push((stage, fraction)),
+        || Ok(()),
+    )?;
+    let fractions: Vec<_> = progress
+        .iter()
+        .map(|(stage, fraction)| fraction.expect(stage))
+        .collect();
+    assert_eq!(fractions.first(), Some(&0.0));
+    assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(fractions.iter().all(|&fraction| fraction < 1.0));
+    assert_eq!(
+        progress.last(),
+        Some(&("生成 STACTA 索引".into(), Some(0.90)))
+    );
     let serial_output = request.output;
     request.output = root.path().join("parallel");
     let parallel = run_with_pool(&request, &cancelled, |_, _| {}, || Ok(()), Some(&pool))?;

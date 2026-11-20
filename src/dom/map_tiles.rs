@@ -127,7 +127,7 @@ pub fn run_with_pool(
                     if visited.is_multiple_of(32) || visited == total {
                         progress(
                             format!("生成 {zoom} 级地图切片"),
-                            Some(visited as f32 / total as f32),
+                            Some(0.85 * (visited as f32 / total as f32)),
                         );
                     }
                 }
@@ -142,7 +142,7 @@ pub fn run_with_pool(
             "{} 没有有效瓦片",
             request.input.display()
         );
-        progress("生成 STACTA 索引".into(), None);
+        progress("生成 STACTA 索引".into(), Some(0.90));
         stacta::write_rgba_png(
             staging,
             id,

@@ -61,7 +61,7 @@ pub fn run_with_pool(
         .unwrap_or(Path::new("."));
     progress(Progress {
         stage: "读取 GeoTIFF".into(),
-        fraction: None,
+        fraction: Some(0.0),
     });
     let mut source =
         Source::open(&input).with_context(|| format!("无法转换 {}", input.display()))?;
