@@ -331,7 +331,15 @@ fn preserves_relative_paging_and_reports_missing_tiles() {
         lod.extend(0f32.to_le_bytes());
         lod.extend(1f32.to_le_bytes());
     }
-    lod.push(0); // Children
+    let mut empty_geometry = vec![0; 11]; // Drawable fields
+    empty_geometry.extend(0u32.to_le_bytes()); // PrimitiveSetList
+    empty_geometry.extend([0; 5]); // VertexArray and optional attribute arrays
+    empty_geometry.extend([0; 8]); // TexCoordArrayList and VertexAttribArrayList
+    let child = object("osg::Geometry", 5, empty_geometry);
+    lod.push(1); // Children
+    lod.extend(1u32.to_le_bytes());
+    lod.extend(((child.len() + 4) as u32).to_le_bytes());
+    lod.extend(child);
     let mut scene = input[..25].to_vec();
     scene.extend(object("osg::PagedLOD", 4, lod));
     fs::write(model.join("Block.osgb"), scene).unwrap();

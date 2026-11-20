@@ -814,9 +814,9 @@ impl Reader<'_> {
             self.end()?;
             primitives.push((start..self.pos, fields..header_end, indices));
         }
-        let (vertex_block, vertices) = self.optional_array()?.ok_or("缺少位置数组")?;
-        if vertices.width != 3 {
-            return Err("位置数组必须为三维".into());
+        let vertices = self.optional_array()?;
+        if vertices.is_none() && primitive_count != 0 {
+            return Err("缺少位置数组".into());
         }
         let mut arrays = Vec::new();
         for kind in 0..4 {
@@ -829,6 +829,13 @@ impl Reader<'_> {
         }
         if self.u32()? != 0 {
             return Err("不支持自定义顶点属性".into());
+        }
+        let Some((vertex_block, vertices)) = vertices else {
+            // 分页节点可以内嵌无图元的空几何。
+            return Ok(());
+        };
+        if vertices.width != 3 {
+            return Err("位置数组必须为三维".into());
         }
         let vertex_count = vertices.values.len() / 3;
         for (_, (_, array)) in &arrays {
