@@ -10,6 +10,7 @@ use tiff::{
     decoder::{Decoder, IfdDecoder, TiffCodingUnit},
     tags::Tag,
 };
+use webgis_core::message;
 
 pub(super) struct Source {
     pub size: [u32; 2],
@@ -38,7 +39,7 @@ impl Source {
         let chunk: [u32; 2] = decoder.chunk_dimensions().into();
         ensure!(
             size.into_iter().chain(chunk).all(|n| n > 0),
-            "TIFF 图像或块尺寸无效"
+            message!(invalid_tiff_image_or_block_dimensions)
         );
         let tiled = decoder.get_chunk_type() == tiff::decoder::ChunkType::Tile;
         let mut tags = decoder.image_ifd();
@@ -47,7 +48,9 @@ impl Source {
         let bits_per_sample = tags
             .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)?
             .unwrap_or_default();
-        let bits = *bits_per_sample.first().context("缺少 TIFF BitsPerSample")?;
+        let bits = *bits_per_sample
+            .first()
+            .context(message!(missing_tiff_bitspersample))?;
         let format = tags
             .find_tag_unsigned_vec::<u16>(Tag::SampleFormat)?
             .unwrap_or_else(|| vec![1]);
@@ -55,7 +58,7 @@ impl Source {
             (8, 0 | 1, 1 | 2) => 1,
             (8, 2, 3 | 4) => 3,
             (32, 1, 1) => 1,
-            _ => anyhow::bail!("仅支持 8 位灰度、灰度 Alpha、RGB、RGBA 或单波段 Float32 GeoTIFF"),
+            _ => anyhow::bail!(message!(unsupported_cog_pixel_type)),
         };
         ensure!(
             bits_per_sample.iter().all(|&value| value == bits)
@@ -63,7 +66,7 @@ impl Source {
                 && format
                     .iter()
                     .all(|&value| value == if bits == 32 { 3 } else { 1 }),
-            "不支持的 TIFF 像元类型"
+            message!(unsupported_tiff_pixel_type)
         );
         let decoded_width = if tiled { chunk[0] } else { size[0] };
         let decoded_rows = if tiled {
@@ -74,7 +77,7 @@ impl Source {
         let bytes_per_row = u64::from(decoded_width) * u64::from(bits / 8 * samples);
         ensure!(
             bytes_per_row <= MAX_CHUNK as u64 / u64::from(decoded_rows),
-            "单个 TIFF 块超过 64 MiB，请使用较小的条带或分块"
+            message!(a_tiff_block_exceeds_64_mib_use_smaller_strips_or_tiles)
         );
         let extra = tags
             .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)?
@@ -82,7 +85,7 @@ impl Source {
         let alpha = match (samples - colors, extra.as_slice()) {
             (0, []) => None,
             (1, [kind @ (1 | 2)]) => Some(*kind),
-            _ => anyhow::bail!("额外的 TIFF 波段必须标记为 Alpha"),
+            _ => anyhow::bail!(message!(extra_tiff_bands_must_be_marked_as_alpha)),
         };
         let planar = match tags
             .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)?
@@ -90,19 +93,19 @@ impl Source {
         {
             1 => false,
             2 => true,
-            _ => anyhow::bail!("无效的 TIFF 波段排列"),
+            _ => anyhow::bail!(message!(invalid_tiff_band_layout)),
         };
         ensure!(
             tags.find_tag_unsigned::<u16>(Tag::Orientation)?
                 .unwrap_or(1)
                 == 1,
-            "仅支持左上角为原点的 TIFF 像元排列"
+            message!(only_tiff_pixels_with_a_top_left_origin_are_supported)
         );
         let nodata = ascii(&mut tags, Tag::GdalNodata)?;
         if let Some(text) = &nodata {
             text.trim()
                 .parse::<f64>()
-                .context("无效的 TIFF NoData 值")?;
+                .context(message!(invalid_tiff_nodata_value))?;
         }
         let geo = geotags(&mut tags)?;
         let sub_ifds = tags
@@ -113,7 +116,7 @@ impl Source {
         let chunks = u64::from(size[0].div_ceil(chunk[0])) * u64::from(size[1].div_ceil(chunk[1]));
         ensure!(
             chunks <= u64::from(u32::MAX) / if planar { u64::from(samples) } else { 1 },
-            "TIFF 块数超出解码范围"
+            message!(tiff_block_count_exceeds_the_decoding_limit)
         );
         let white_alpha = if photo == 0 && samples == 2 {
             Some(WhiteAlpha::new(&mut tags, tiled, chunks as usize)?)
@@ -154,10 +157,12 @@ impl Source {
         let data = self
             .cache
             .get(index, || {
-                let len = plane.checked_mul(pixel_bytes).context("TIFF 块尺寸溢出")?;
+                let len = plane
+                    .checked_mul(pixel_bytes)
+                    .context(message!(tiff_block_size_overflow))?;
                 ensure!(
                     len <= MAX_CHUNK,
-                    "单个 TIFF 块超过 64 MiB，请使用较小的条带或分块"
+                    message!(a_tiff_block_exceeds_64_mib_use_smaller_strips_or_tiles)
                 );
                 if let Some(white) = &self.white_alpha {
                     return white.read(
@@ -181,7 +186,7 @@ impl Source {
                 }
                 Ok(data)
             })
-            .with_context(|| format!("无法读取 TIFF 数据块 {index}"))?;
+            .with_context(|| message!(could_not_read_tiff_block_index, index = index))?;
         if self.bits == 32 {
             let bytes = data[pos * 4..pos * 4 + 4].try_into()?;
             out.copy_from_slice(&u32::from_ne_bytes(bytes).to_le_bytes());
@@ -206,10 +211,13 @@ fn ascii(tags: &mut IfdDecoder<'_>, tag: Tag) -> Result<Option<String>> {
 fn geotags(tags: &mut IfdDecoder<'_>) -> Result<Vec<Field>> {
     let keys = tags
         .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
-        .context("缺少或无法读取坐标系 GeoKey")?;
-    ensure!(keys.len() >= 4 && keys[0] == 1, "无效的 GeoKey 目录");
+        .context(message!(crs_geokey_is_missing_or_unreadable))?;
+    ensure!(
+        keys.len() >= 4 && keys[0] == 1,
+        message!(invalid_geokey_directory)
+    );
     let end = 4 + usize::from(keys[3]) * 4;
-    ensure!(end <= keys.len(), "GeoKey 目录不完整");
+    ensure!(end <= keys.len(), message!(geokey_directory_is_incomplete));
     let doubles = tags
         .find_tag(Tag::GeoDoubleParamsTag)?
         .map(|v| v.into_f64_vec())
@@ -227,10 +235,13 @@ fn geotags(tags: &mut IfdDecoder<'_>) -> Result<Vec<Field>> {
         None => key(3072).or_else(|| key(2048)),
         _ => None,
     };
-    ensure!(code.is_some_and(|n| n > 0), "GeoKey 缺少内嵌坐标系定义");
+    ensure!(
+        code.is_some_and(|n| n > 0),
+        message!(geokey_is_missing_an_embedded_crs_definition)
+    );
     ensure!(
         matches!(key(1025), None | Some(1 | 2)),
-        "不支持的 GeoTIFF 像元定位类型"
+        message!(unsupported_geotiff_raster_pixel_type)
     );
     for e in entries.chunks_exact(4) {
         let available = match e[1] {
@@ -238,11 +249,11 @@ fn geotags(tags: &mut IfdDecoder<'_>) -> Result<Vec<Field>> {
             34735 => keys.len(),
             34736 => doubles.as_ref().map_or(0, Vec::len),
             34737 => citation.as_ref().map_or(0, |s| s.len() + 1),
-            _ => anyhow::bail!("不支持的 GeoKey 参数标签 {}", e[1]),
+            _ => anyhow::bail!(message!(unsupported_geokey_parameter_tag, e[1])),
         };
         ensure!(
             usize::from(e[2]) + usize::from(e[3]) <= available,
-            "GeoKey 参数超出范围"
+            message!(geokey_parameter_is_out_of_range)
         );
     }
     let mut geo = vec![Field::shorts(Tag::GeoKeyDirectoryTag, &keys)];
@@ -281,7 +292,7 @@ fn geotags(tags: &mut IfdDecoder<'_>) -> Result<Vec<Field>> {
             geo.push(Field::doubles(Tag::ModelTiepointTag, &t));
             Affine([t[3] - t[0] * s[0], s[0], 0., t[4] + t[1] * s[1], 0., -s[1]])
         }
-        _ => anyhow::bail!("缺少有效的地理定位：需要像元比例和控制点，或仿射变换矩阵"),
+        _ => anyhow::bail!(message!(missing_valid_georeferencing_supply_pixel_scale_and_tie_points_or_an_affine_transformation_matrix)),
     };
     transform.inverse()?;
     Ok(geo)

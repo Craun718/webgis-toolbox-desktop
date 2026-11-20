@@ -1,8 +1,10 @@
 //! 按概览分辨率从低到高写入瓦片，所有 IFD 和索引都在数据块之前。
+
+use webgis_core::message;
 mod source;
 mod writer;
 
-use super::{Progress, check_cancelled, tiff_output::TILE};
+use super::{Phase, Progress, TaskProgress, check_cancelled, tiff_output::TILE};
 use anyhow::{Context, Result, ensure};
 use source::Source;
 use std::{
@@ -36,52 +38,77 @@ pub fn run_with_pool(
     before_publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<PathBuf> {
+    run_with_progress(
+        input,
+        output,
+        cancelled,
+        |event| progress(event.display),
+        before_publish,
+        pool,
+    )
+}
+
+pub fn run_with_progress(
+    input: &Path,
+    output: &Path,
+    cancelled: &AtomicBool,
+    progress: impl Fn(TaskProgress),
+    before_publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
+) -> Result<PathBuf> {
     check_cancelled(cancelled)?;
     ensure!(
         input
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")),
-        "输入必须是 .tif 或 .tiff 文件"
+        message!(input_must_be_a_tif_or_tiff_file)
     );
     let input = input
         .canonicalize()
-        .with_context(|| format!("无法打开 {}", input.display()))?;
+        .with_context(|| message!(could_not_open, input.display()))?;
     if output.canonicalize().is_ok_and(|path| path == input) {
-        anyhow::bail!("COG 输出不能指向源文件");
+        anyhow::bail!(message!(cog_output_cannot_point_to_the_source_file));
     }
     ensure!(
         !output.try_exists()?,
-        "输出文件已存在：{}",
-        output.display()
+        message!(output_file_already_exists, output.display())
     );
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    progress(Progress {
-        stage: "读取 GeoTIFF".into(),
-        fraction: None,
-    });
+    progress(TaskProgress::new(
+        Phase::ReadGeoTiff,
+        message!(read_geotiff),
+        None,
+    ));
     let mut source =
-        Source::open(&input).with_context(|| format!("无法转换 {}", input.display()))?;
+        Source::open(&input).with_context(|| message!(could_not_read, input.display()))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("无法在 {} 创建临时文件", parent.display()))?;
+        .with_context(|| message!(could_not_create_a_temporary_file_in, parent.display()))?;
     writer::write(
         &mut BufWriter::new(temp.as_file_mut()),
         &mut source,
         cancelled,
         progress,
         pool,
-    )?;
+    )
+    .map_err(|error| {
+        if error.is::<std::io::Error>() {
+            error.context(message!(write_cog, output.display()))
+        } else {
+            error
+        }
+    })?;
     check_cancelled(cancelled)?;
     before_publish()?;
     check_cancelled(cancelled)?;
     temp.persist_noclobber(output).map_err(|error| {
         if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow::anyhow!("输出文件已存在：{}", output.display())
+            anyhow::anyhow!(message!(output_file_already_exists, output.display()))
         } else {
-            anyhow::Error::new(error).context(format!("无法发布 COG 至 {}", output.display()))
+            anyhow::Error::new(error).context(message!(could_not_publish_cog_to, output.display()))
         }
     })?;
     Ok(output.to_owned())

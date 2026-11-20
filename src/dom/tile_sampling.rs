@@ -9,6 +9,7 @@ use image::{Rgba, RgbaImage};
 use proj4rs::{adaptors::transform_vertex_3d, proj::Proj};
 use std::sync::atomic::AtomicBool;
 use tiles_toolbox::tiles::HALF_WORLD;
+use webgis_core::message;
 
 type Point = [f64; 2];
 type Quad = [Point; 4];
@@ -139,7 +140,10 @@ impl Grid {
                 ranges.push([west, south, east, north]);
             }
         }
-        ensure!(!ranges.is_empty(), "影像不覆盖 WebMercatorQuad 范围");
+        ensure!(
+            !ranges.is_empty(),
+            message!(image_does_not_overlap_the_webmercatorquad_extent)
+        );
         Ok(ranges)
     }
 

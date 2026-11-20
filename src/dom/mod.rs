@@ -1,3 +1,4 @@
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 pub mod cog;
 mod geotiff;
@@ -72,6 +73,50 @@ pub struct Progress {
     pub fraction: Option<f32>,
 }
 
+/// Stable processing stages used by the desktop task log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Prepare,
+    ScanModels,
+    ReadModel,
+    IndexTriangles,
+    Rasterize,
+    BuildOverviews,
+    ValidateRaster,
+    ReadGeoTiff,
+    WriteCogLevel(usize),
+    FlushCog,
+    ScanLayers,
+    CheckClip,
+    ClipModel,
+    PrepareTiles,
+    ScanTiles,
+    Mosaic,
+    Pyramid,
+    CreateStacta,
+    GenerateTiles,
+    IndexTiles,
+    Publish,
+}
+
+/// Progress with a stage identifier independent of its localized display text.
+pub struct TaskProgress {
+    pub phase: Phase,
+    pub display: Progress,
+}
+
+impl TaskProgress {
+    pub fn new(phase: Phase, stage: impl Into<String>, fraction: Option<f32>) -> Self {
+        Self {
+            phase,
+            display: Progress {
+                stage: stage.into(),
+                fraction,
+            },
+        }
+    }
+}
+
 pub const PRODUCTS: [&str; 3] = ["dsm.tif", "dom.tif", "run-report.json"];
 
 pub fn parse_origin(value: &str) -> Result<[f64; 3]> {
@@ -82,8 +127,11 @@ pub fn parse_origin(value: &str) -> Result<[f64; 3]> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let origin: [f64; 3] = values
         .try_into()
-        .map_err(|_| anyhow!("原点须包含三个坐标"))?;
-    ensure!(origin.iter().all(|v| v.is_finite()), "原点须为有限数值");
+        .map_err(|_| anyhow!(message!(the_origin_must_contain_three_coordinates)))?;
+    ensure!(
+        origin.iter().all(|v| v.is_finite()),
+        message!(origin_coordinates_must_be_finite_numbers)
+    );
     Ok(origin)
 }
 
@@ -106,7 +154,10 @@ fn scan_osgb(directory: &Path, cancelled: &AtomicBool) -> Result<Vec<PathBuf>> {
             roots.push(entry.path());
         }
     }
-    ensure!(roots.len() <= 1, "模型目录包含多个 Block.osgb 入口");
+    ensure!(
+        roots.len() <= 1,
+        message!(the_model_folder_has_multiple_block_osgb_entries)
+    );
     if !roots.is_empty() {
         return Ok(roots);
     }
@@ -120,7 +171,10 @@ fn scan_osgb(directory: &Path, cancelled: &AtomicBool) -> Result<Vec<PathBuf>> {
             files.push(entry.into_path());
         }
     }
-    ensure!(!files.is_empty(), "metadata.xml 所在目录内没有 OSGB 文件");
+    ensure!(
+        !files.is_empty(),
+        message!(no_osgb_files_in_the_metadata_xml_folder)
+    );
     let pattern = Regex::new(r"(?i)^(.+)_L(\d+)_(\d+)$")?;
     let mut groups = BTreeMap::<String, (u32, Vec<PathBuf>)>::new();
     for path in &files {
@@ -176,7 +230,7 @@ fn metadata_values(path: &Path) -> Result<(Option<String>, Option<[f64; 3]>)> {
                     }
                 }
             }
-            Event::DocType(_) => bail!("metadata.xml 不支持 DTD"),
+            Event::DocType(_) => bail!(message!(dtd_is_unsupported_in_metadata_xml)),
             Event::Eof => break,
             _ => {}
         }
@@ -200,7 +254,7 @@ fn xml_value(
             }
             Event::Comment(_) => {}
             Event::End(tag) if tag.name() == name => return Ok(result.trim().to_owned()),
-            _ => bail!("metadata.xml 的坐标系与原点字段必须为文本"),
+            _ => bail!(message!(crs_and_origin_fields_in_metadata_xml_must_be_text)),
         }
     }
 }
@@ -208,42 +262,44 @@ fn xml_value(
 fn prepare(
     request: &Request,
     cancelled: &AtomicBool,
-    progress: &mut impl FnMut(Progress),
+    progress: &mut impl FnMut(TaskProgress),
 ) -> Result<(Summary, Mesh, Option<Crs>)> {
     ensure!(
         request.resolution.is_finite() && request.resolution > 0.,
-        "分辨率必须为有限正数"
+        message!(resolution_must_be_finite_and_positive)
     );
     ensure!(
         request.mode != Mode::Local || request.crs.is_none(),
-        "本地模式不能指定坐标系"
+        message!(local_mode_does_not_accept_a_crs)
     );
     ensure!(
         request.mode != Mode::Absolute || request.origin.is_none(),
-        "绝对坐标模式不能指定原点偏移"
+        message!(absolute_coordinate_mode_does_not_accept_an_origin_offset)
     );
-    progress(Progress {
-        stage: "扫描 OSGB 与元数据".into(),
-        fraction: None,
-    });
+    progress(TaskProgress::new(
+        Phase::ScanModels,
+        message!(scan_osgb_and_metadata),
+        None,
+    ));
     let input_metadata = match fs::metadata(&request.input) {
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            bail!("输入文件不存在：{}", request.input.display());
+            bail!(message!(input_file_does_not_exist, request.input.display()));
         }
-        result => {
-            result.with_context(|| format!("无法检查输入文件：{}", request.input.display()))?
-        }
+        result => result
+            .with_context(|| message!(could_not_inspect_input_file, request.input.display()))?,
     };
     let metadata_input = is_metadata_file(&request.input);
     ensure!(
         input_metadata.is_file() && (metadata_input || is_osgb(&request.input)),
-        "请选择根 OSGB 文件或 metadata.xml"
+        message!(select_a_root_osgb_file_or_metadata_xml)
     );
     let input = request
         .input
         .canonicalize()
-        .with_context(|| request.input.display().to_string())?;
-    let root = input.parent().context("缺少输入父目录")?;
+        .with_context(|| message!(could_not_open, request.input.display()))?;
+    let root = input
+        .parent()
+        .context(message!(input_has_no_parent_folder))?;
     let (selected, metadata) = if metadata_input {
         (scan_osgb(root, cancelled)?, Some(input.clone()))
     } else {
@@ -256,7 +312,7 @@ fn prepare(
     };
     let (metadata_crs, metadata_origin) = metadata
         .as_deref()
-        .map(|path| metadata_values(path).with_context(|| path.display().to_string()))
+        .map(|path| metadata_values(path).with_context(|| message!(could_not_read, path.display())))
         .transpose()?
         .unwrap_or_default();
     let origin = match request.mode {
@@ -265,14 +321,20 @@ fn prepare(
         Mode::Relative => request
             .origin
             .or(metadata_origin)
-            .context("缺少 SRSOrigin，请指定原点或改用绝对坐标／本地模式")?,
+            .context(message!(missing_srs_origin))?,
     };
-    ensure!(origin.iter().all(|v| v.is_finite()), "原点须为有限数值");
+    ensure!(
+        origin.iter().all(|v| v.is_finite()),
+        message!(origin_coordinates_must_be_finite_numbers)
+    );
     let crs = match request.mode {
         Mode::Local => None,
         _ => Some(request.crs.clone().or(metadata_crs).with_context(|| {
             let source = metadata.as_ref().unwrap_or(&input);
-            format!("{} 缺少 SRS，请指定坐标系或选择本地模式", source.display())
+            message!(
+                lacks_srs_specify_the_crs_or_select_local_mode,
+                source.display()
+            )
         })?),
     };
     let epsg = crs
@@ -285,21 +347,24 @@ fn prepare(
             } else {
                 metadata.as_ref().unwrap_or(&input)
             };
-            format!("{} 的坐标系无效", source.display())
+            message!(invalid_crs_in, source.display())
         })?;
     let (mesh, selected) = Mesh::load(root, selected, origin, cancelled, progress)?;
     let bounds = mesh.bounds;
     let [min_x, min_y, _, max_x, max_y, _] = bounds;
-    ensure!(max_x > min_x && max_y > min_y, "模型没有有效的 XY 范围");
+    ensure!(
+        max_x > min_x && max_y > min_y,
+        message!(model_has_no_valid_xy_extent)
+    );
     ensure!(
         min_x + request.resolution > min_x && max_y - request.resolution < max_y,
-        "像元尺寸低于坐标数值精度"
+        message!(pixel_size_is_below_coordinate_precision)
     );
     let size =
         [max_x - min_x, max_y - min_y].map(|span| (span / request.resolution).ceil().max(1.));
     ensure!(
         size.iter().all(|v| *v <= f64::from(i32::MAX)),
-        "栅格尺寸超出支持范围"
+        message!(raster_dimensions_exceed_the_supported_limits)
     );
     let summary = Summary {
         selected,
@@ -319,6 +384,14 @@ pub fn preflight(
     request: &Request,
     cancelled: &AtomicBool,
     mut progress: impl FnMut(Progress),
+) -> Result<Summary> {
+    preflight_with_progress(request, cancelled, |event| progress(event.display))
+}
+
+pub fn preflight_with_progress(
+    request: &Request,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(TaskProgress),
 ) -> Result<Summary> {
     let (summary, _, _) = prepare(request, cancelled, &mut progress)?;
     check_cancelled(cancelled)?;
@@ -341,22 +414,44 @@ pub fn run_with_pool(
     before_publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<PathBuf>> {
+    run_with_progress(
+        request,
+        cancelled,
+        |event| progress(event.display),
+        before_publish,
+        pool,
+    )
+}
+
+pub fn run_with_progress(
+    request: &Request,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(TaskProgress),
+    before_publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
+) -> Result<Vec<PathBuf>> {
     // 模型读取占总进度的前 20%，预检仍使用自身的读取进度。
     let (summary, mesh, crs) = prepare(request, cancelled, &mut |mut event| {
-        event.fraction = event.fraction.map(|fraction| fraction * 0.20);
+        event.display.fraction = event.display.fraction.map(|fraction| fraction * 0.20);
         progress(event);
     })?;
     check_cancelled(cancelled)?;
-    fs::create_dir_all(&request.output)?;
-    let output = request.output.canonicalize()?;
-    let lock = fs::File::open(&output)?;
+    fs::create_dir_all(&request.output)
+        .with_context(|| message!(create_folder, request.output.display()))?;
+    let output = request
+        .output
+        .canonicalize()
+        .with_context(|| message!(could_not_resolve_output_path, request.output.display()))?;
+    let lock =
+        fs::File::open(&output).with_context(|| message!(could_not_open, output.display()))?;
     use rustix::fs::{FlockOperation, flock};
     flock(&lock, FlockOperation::NonBlockingLockExclusive)
-        .context("无法锁定输出目录，可能有另一个任务正在写入")?;
+        .context(message!(output_folder_lock_failed))?;
     check_conflicts(&output, request.overwrite)?;
     let staging = tempfile::Builder::new()
         .prefix(".osgb-raster-")
-        .tempdir_in(&output)?;
+        .tempdir_in(&output)
+        .with_context(|| message!(create_temporary_folder_in, output.display()))?;
     let stage = staging.path();
     let [width, height] = summary.size;
     let [west, _, _, _, north, _] = summary.bounds;
@@ -372,20 +467,22 @@ pub fn run_with_pool(
     let mut dom_file = BigTiff::new_big(fs::File::create(&dom_path)?)?;
     let mut dsm = LevelWriter::new(&mut dsm_file, RasterKind::Dsm)?;
     let mut dom = LevelWriter::new(&mut dom_file, RasterKind::Dom)?;
-    progress(Progress {
-        stage: "构建三角形索引".into(),
-        fraction: Some(0.20),
-    });
+    progress(TaskProgress::new(
+        Phase::IndexTriangles,
+        message!(build_triangle_index),
+        Some(0.20),
+    ));
     let index = raster::index(&mesh.triangles);
     let mut textures: Vec<_> = (0..task_pool::width(pool))
         .map(|_| TextureCache::new(&mesh.images))
         .collect();
     let (w, h) = (width as usize, height as usize);
     let count = w.div_ceil(TILE) as u64 * h.div_ceil(TILE) as u64;
-    progress(Progress {
-        stage: format!("栅格化 0/{count} 块"),
-        fraction: Some(0.50),
-    });
+    progress(TaskProgress::new(
+        Phase::Rasterize,
+        message!(rasterize_0_count_blocks, count = count),
+        Some(0.50),
+    ));
     let mut done = 0_u64;
     let mut dsm_valid_pixels = 0_u64;
     let mut dom_valid_pixels = 0_u64;
@@ -408,19 +505,20 @@ pub fn run_with_pool(
             dsm.height(size, &z)?;
             dom.color(size, &color)?;
             done += 1;
-            progress(Progress {
-                stage: format!("栅格化 {done}/{count} 块"),
-                fraction: Some(0.50 + 0.30 * (done as f32 / count as f32)),
-            });
+            progress(TaskProgress::new(
+                Phase::Rasterize,
+                message!(rasterize_done_count_blocks, done = done, count = count),
+                Some(0.50 + 0.30 * (done as f32 / count as f32)),
+            ));
         }
     }
     ensure!(
         dsm_valid_pixels > 0,
-        "没有像元中心落在模型表面，请减小像元尺寸"
+        message!(no_pixel_centers_fall_on_the_model_surface_reduce_the_pixel_size)
     );
     ensure!(
         dom_valid_pixels > 0,
-        "最高表面没有可见纹理像元，无法生成 DOM"
+        message!(the_topmost_surface_has_no_visible_texture_pixels_dom_cannot_be_generated)
     );
     dsm.finish(spec, false)?;
     if let Some(mask) = dom.finish(spec, false)? {
@@ -430,10 +528,11 @@ pub fn run_with_pool(
         .into_iter()
         .filter(|&n| n <= w.min(h))
         .collect();
-    progress(Progress {
-        stage: "构建内部概览".into(),
-        fraction: Some(0.80),
-    });
+    progress(TaskProgress::new(
+        Phase::BuildOverviews,
+        message!(build_internal_overviews),
+        Some(0.80),
+    ));
     tiff_output::overviews(
         &mut dsm_file,
         &dsm_path,
@@ -442,7 +541,7 @@ pub fn run_with_pool(
         &levels,
         cancelled,
     )
-    .with_context(|| format!("构建 {} 的内部概览", PRODUCTS[0]))?;
+    .with_context(|| message!(build_internal_overviews_for, PRODUCTS[0]))?;
     tiff_output::overviews(
         &mut dom_file,
         &dom_path,
@@ -451,18 +550,19 @@ pub fn run_with_pool(
         &levels,
         cancelled,
     )
-    .with_context(|| format!("构建 {} 的内部概览", PRODUCTS[1]))?;
+    .with_context(|| message!(build_internal_overviews_for, PRODUCTS[1]))?;
     drop((dsm_file, dom_file));
-    progress(Progress {
-        stage: "校验写出结果".into(),
-        fraction: Some(0.90),
-    });
+    progress(TaskProgress::new(
+        Phase::ValidateRaster,
+        message!(validate_written_files),
+        Some(0.90),
+    ));
     for (path, kind, valid) in [
         (&dsm_path, RasterKind::Dsm, dsm_valid_pixels),
         (&dom_path, RasterKind::Dom, dom_valid_pixels),
     ] {
         tiff_output::verify(path, spec, kind, &levels, valid, cancelled)
-            .with_context(|| format!("校验 {}", path.display()))?;
+            .with_context(|| message!(validate, path.display()))?;
     }
     let products: Vec<_> = PRODUCTS.iter().map(|name| output.join(name)).collect();
     let report = RunReport {
@@ -475,7 +575,7 @@ pub fn run_with_pool(
     fs::write(stage.join(PRODUCTS[2]), serde_json::to_vec_pretty(&report)?)?;
     ensure!(
         fs::read_dir(stage)?.count() == PRODUCTS.len(),
-        "输出包含意外的 GeoTIFF 旁车文件"
+        message!(output_contains_unexpected_geotiff_sidecar_files)
     );
     check_cancelled(cancelled)?;
     before_publish()?;
@@ -484,7 +584,10 @@ pub fn run_with_pool(
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
-    ensure!(!cancelled.load(Ordering::Relaxed), "处理已取消");
+    ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        message!(processing_canceled)
+    );
     Ok(())
 }
 
@@ -493,8 +596,14 @@ fn check_conflicts(output: &Path, overwrite: bool) -> Result<()> {
         let path = output.join(name);
         match path.symlink_metadata() {
             Ok(meta) => {
-                ensure!(meta.is_file(), "产物位置不是常规文件：{}", path.display());
-                ensure!(overwrite, "产物已存在，请确认覆盖：{}", path.display());
+                ensure!(
+                    meta.is_file(),
+                    message!(output_path_is_not_a_regular_file, path.display())
+                );
+                ensure!(
+                    overwrite,
+                    message!(output_already_exists_confirm_overwrite, path.display())
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| path.display().to_string()),
@@ -504,16 +613,20 @@ fn check_conflicts(output: &Path, overwrite: bool) -> Result<()> {
                 let sidecar = output.join(format!("{name}{suffix}"));
                 ensure!(
                     matches!(sidecar.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
-                    "产物位置存在旁车文件：{}",
-                    sidecar.display()
+                    message!(
+                        a_sidecar_file_already_exists_at_the_output_location,
+                        sidecar.display()
+                    )
                 );
             }
             for extension in ["tfw", "wld", "tifw", "aux"] {
                 let sidecar = path.with_extension(extension);
                 ensure!(
                     matches!(sidecar.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
-                    "产物位置存在旁车文件：{}",
-                    sidecar.display()
+                    message!(
+                        a_sidecar_file_already_exists_at_the_output_location,
+                        sidecar.display()
+                    )
                 );
             }
         }
@@ -560,13 +673,14 @@ fn publish(stage: &Path, output: &Path, overwrite: bool) -> Result<()> {
         }
         if !failures.is_empty() {
             let preserved = backup.keep();
-            bail!(
-                "发布失败：{error:#}。回滚失败：{}。备份保留于 {}",
+            bail!(message!(
+                publishing_failed_error_rollback_failed_backup_retained_at,
                 failures.join("；"),
-                preserved.display()
-            );
+                preserved.display(),
+                error = error
+            ));
         }
-        return Err(error).context("发布失败，已回滚");
+        return Err(error).context(message!(publishing_failed_changes_were_rolled_back));
     }
     Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::message;
 use geo::{Coord, LineString, Polygon};
 use proj4rs::{adaptors::transform_vertex_3d, proj::Proj};
 use quick_xml::{Reader, events::Event};
@@ -19,34 +20,41 @@ impl Reference {
             match reader.read_event().map_err(|err| err.to_string())? {
                 Event::Start(tag) if depth == 1 && tag.local_name().as_ref() == b"SRS" => {
                     if srs.is_some() {
-                        return Err("metadata.xml 包含多个 SRS".into());
+                        return Err(message!(metadata_xml_contains_multiple_srs_elements).into());
                     }
                     srs = Some(xml_value(&mut reader, tag.name())?);
                 }
                 Event::Start(tag) if depth == 1 && tag.local_name().as_ref() == b"SRSOrigin" => {
                     if origin.is_some() {
-                        return Err("metadata.xml 包含多个 SRSOrigin".into());
+                        return Err(
+                            message!(metadata_xml_contains_multiple_srsorigin_elements).into()
+                        );
                     }
                     origin = Some(coordinates(&xml_value(&mut reader, tag.name())?)?);
                 }
                 Event::Start(tag) => {
                     if depth == 0 && tag.local_name().as_ref() != b"ModelMetadata" {
-                        return Err("metadata.xml 缺少 ModelMetadata 根元素".into());
+                        return Err(message!(
+                            metadata_xml_is_missing_its_modelmetadata_root_element
+                        )
+                        .into());
                     }
                     depth += 1;
                 }
                 Event::End(_) => depth -= 1,
-                Event::DocType(_) => return Err("metadata.xml 不支持 DTD".into()),
+                Event::DocType(_) => {
+                    return Err(message!(dtd_is_unsupported_in_metadata_xml).into());
+                }
                 Event::Eof => break,
                 _ => {}
             }
         }
         if depth != 0 {
-            return Err("metadata.xml 未闭合".into());
+            return Err(message!(unclosed_element_in_metadata_xml).into());
         }
         Ok(Self {
-            srs: srs.ok_or("metadata.xml 缺少 SRS")?,
-            origin: origin.ok_or("metadata.xml 缺少 SRSOrigin")?,
+            srs: srs.ok_or(message!(metadata_xml_is_missing_srs))?,
+            origin: origin.ok_or(message!(metadata_xml_is_missing_srsorigin))?,
         })
     }
 
@@ -66,11 +74,14 @@ impl Reference {
         source: &str,
     ) -> Result<Vec<Polygon>, String> {
         if self.origin.iter().any(|v| !v.is_finite()) {
-            return Err("模型 XYZ 原点必须为有限数值".into());
+            return Err(message!(model_xyz_origin_coordinates_must_be_finite).into());
         }
         let source = projection(source)?;
         if source.is_geocent() || !source.is_normalized_axis() {
-            return Err("范围坐标系需要使用经纬度或东、北轴的投影坐标".into());
+            return Err(message!(
+                boundary_crs_must_use_longitude_latitude_or_projected_easting_northing_coordinates
+            )
+            .into());
         }
         let srs = self.srs.trim();
         let anchor = srs.strip_prefix("ENU:").map(coordinates::<2>).transpose()?;
@@ -80,7 +91,10 @@ impl Reference {
             projection(srs)?
         };
         if target.is_geocent() || !target.is_normalized_axis() {
-            return Err("模型坐标系需要使用经纬度、东、北轴的投影坐标或 ENU".into());
+            return Err(message!(
+                model_crs_must_use_longitude_latitude_projected_easting_northing_or_enu_coordinates
+            )
+            .into());
         }
 
         let enu = anchor.map(Enu::new).transpose()?;
@@ -89,7 +103,7 @@ impl Reference {
                 .into_iter()
                 .map(|point| {
                     if !point.x.is_finite() || !point.y.is_finite() {
-                        return Err("范围包含非有限坐标".into());
+                        return Err(message!(boundary_contains_non_finite_coordinates).into());
                     }
                     let (x, y) = if source.is_latlong() {
                         check_lon_lat(point.x, point.y)?;
@@ -99,7 +113,12 @@ impl Reference {
                     };
                     let (x, y, _) =
                         transform_vertex_3d(&source, &target, (x, y, 0.)).map_err(|err| {
-                            format!("范围坐标转换失败 ({}, {})：{err}", point.x, point.y)
+                            message!(
+                                boundary_coordinate_transformation_failed_at_err,
+                                point.x,
+                                point.y,
+                                err = err
+                            )
                         })?;
                     let (x, y) = if let Some(enu) = &enu {
                         check_lon_lat(x.to_degrees(), y.to_degrees())?;
@@ -114,7 +133,7 @@ impl Reference {
                         y: y - self.origin[1],
                     };
                     if !xy.x.is_finite() || !xy.y.is_finite() {
-                        return Err("坐标转换结果超出范围".into());
+                        return Err(message!(transformed_coordinates_are_out_of_range).into());
                     }
                     Ok(xy)
                 })
@@ -150,7 +169,7 @@ fn xml_value(
                 );
             }
             Event::End(tag) if tag.name() == name => return Ok(result.trim().to_owned()),
-            _ => return Err("metadata.xml 的 SRS 字段必须为文本".into()),
+            _ => return Err(message!(srs_in_metadata_xml_must_be_text).into()),
         }
     }
 }
@@ -160,31 +179,37 @@ fn coordinates<const N: usize>(value: &str) -> Result<[f64; N], String> {
         .split(',')
         .map(|part| part.trim().parse::<f64>())
         .collect::<Result<_, _>>()
-        .map_err(|_| format!("无效坐标 {value}"))?;
+        .map_err(|_| message!(invalid_coordinate_value, value = value))?;
     if values.iter().any(|v| !v.is_finite()) {
-        return Err(format!("无效坐标 {value}"));
+        return Err(message!(invalid_coordinate_value, value = value));
     }
     values
         .try_into()
-        .map_err(|_| format!("需要 {N} 个坐标值：{value}"))
+        .map_err(|_| message!(expected_n_coordinate_values_value, N = N, value = value))
 }
 
 fn projection(value: &str) -> Result<Proj, String> {
     let value = value.trim().trim_start_matches('\u{feff}').trim_start();
     let definition = if value.contains('[') {
-        proj4wkt::wkt_to_projstring(value).map_err(|err| format!("无法解析 WKT 坐标系：{err}"))?
+        proj4wkt::wkt_to_projstring(value)
+            .map_err(|err| message!(could_not_parse_the_wkt_crs_err, err = err))?
     } else {
         value.to_owned()
     };
     if definition.contains("+nadgrids") || definition.contains("+geoidgrids") {
-        return Err("当前坐标转换不支持需要格网文件的坐标系".into());
+        return Err(message!(unsupported_crs_grid_file).into());
     }
-    Proj::from_user_string(&definition).map_err(|err| format!("无法使用坐标系 {value}：{err}"))
+    Proj::from_user_string(&definition)
+        .map_err(|err| message!(could_not_use_crs_value_err, value = value, err = err))
 }
 
 fn check_lon_lat(lon: f64, lat: f64) -> Result<(), String> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
-        return Err(format!("无效经纬度 ({lon}, {lat})"));
+        return Err(message!(
+            invalid_longitude_and_latitude_lon_lat,
+            lon = lon,
+            lat = lat
+        ));
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-use super::{Progress, Summary, check_cancelled, tiff_output::NODATA};
+use super::{Phase, Summary, TaskProgress, check_cancelled, tiff_output::NODATA};
 use anyhow::{Context, Result, anyhow, ensure};
 use image::{ImageFormat, ImageReader, Limits, RgbaImage};
 use rstar::{
@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
 };
+use webgis_core::message;
 use webgis_core::model_clip::osgb::{self, RasterImage};
 
 const CACHE_BYTES: usize = 128 * 1024 * 1024;
@@ -49,7 +50,7 @@ impl Mesh {
         files: Vec<PathBuf>,
         origin: [f64; 3],
         cancelled: &AtomicBool,
-        progress: &mut impl FnMut(Progress),
+        progress: &mut impl FnMut(TaskProgress),
     ) -> Result<(Self, Vec<PathBuf>)> {
         let mut mesh = Self {
             bounds: [
@@ -81,22 +82,21 @@ impl Mesh {
                 .with_context(|| file.display().to_string())?;
             ensure!(
                 file.starts_with(root),
-                "外部分页不在模型目录内：{}",
-                file.display()
+                message!(external_page_is_outside_the_model_folder, file.display())
             );
             if visited.contains(&file) {
                 continue;
             }
             ensure!(
                 active.insert(file.clone()),
-                "OSGB 分页存在循环引用：{}",
-                file.display()
+                message!(circular_osgb_page_reference, file.display())
             );
-            progress(Progress {
-                stage: format!("已读取 {read_count} 个模型，正在读取 {}", file.display()),
-                fraction: None,
-            });
-            let context = || file.display().to_string();
+            progress(TaskProgress::new(
+                Phase::ReadModel,
+                message!(read_model, read_count, file.display()),
+                None,
+            ));
+            let context = || message!(could_not_read, file.display());
             let bytes = fs::read(&file).with_context(context)?;
             let mut scene = osgb::raster_mesh(&bytes, cancelled)
                 .map_err(|err| anyhow!(err))
@@ -107,7 +107,7 @@ impl Mesh {
                 let path = Path::new(&name);
                 ensure!(
                     !path.is_absolute() && !name.contains(':'),
-                    "不支持绝对分页路径 {name}"
+                    message!(absolute_page_path_name_is_unsupported, name = name)
                 );
                 pending.push((file.with_file_name(path), false));
             }
@@ -129,11 +129,14 @@ impl Mesh {
                     RasterImage::Embedded { name, bytes: range } => {
                         ensure!(
                             range.len() as u64 <= MAX_ENCODED_BYTES,
-                            "{} 的内嵌纹理 {name} 超出大小限制",
-                            file.display()
+                            message!(
+                                embedded_texture_name_in_0_exceeds_the_size_limit,
+                                file.display(),
+                                name = name
+                            )
                         );
                         Texture {
-                            label: format!("{} 的内嵌纹理 {name}", file.display()),
+                            label: message!(embedded_texture_name_in, file.display(), name = name),
                             source: Source::Embedded {
                                 file: encoded_file.clone(),
                                 range: range.clone(),
@@ -148,7 +151,7 @@ impl Mesh {
                         }
                         external.insert(path.clone(), mesh.images.len());
                         Texture {
-                            label: format!("{} 引用的 {}", file.display(), path.display()),
+                            label: message!(references, file.display(), path.display()),
                             source: Source::External(path),
                         }
                     }
@@ -170,8 +173,7 @@ impl Mesh {
                 for v in xyz {
                     ensure!(
                         v.iter().all(|n| n.is_finite()) && (v[2] as f32).is_finite(),
-                        "{} 的坐标超出范围",
-                        file.display()
+                        message!(coordinates_out_of_range_in, file.display())
                     );
                     for (i, value) in v.into_iter().enumerate() {
                         mesh.bounds[i] = mesh.bounds[i].min(value);
@@ -180,7 +182,11 @@ impl Mesh {
                 }
                 let texture = tri
                     .texture
-                    .map(|id| ids.get(&id).copied().context("找不到纹理对象"))
+                    .map(|id| {
+                        ids.get(&id)
+                            .copied()
+                            .context(message!(texture_object_was_not_found))
+                    })
                     .transpose()
                     .with_context(context)?;
                 mesh.triangles.push(Triangle {
@@ -190,7 +196,10 @@ impl Mesh {
                 });
             }
         }
-        ensure!(!mesh.triangles.is_empty(), "所选模型中没有三角形");
+        ensure!(
+            !mesh.triangles.is_empty(),
+            message!(the_selected_model_contains_no_triangles)
+        );
         Ok((mesh, selected))
     }
 }
@@ -199,17 +208,20 @@ fn texture_path(root: &Path, file: &Path, name: &str) -> Result<PathBuf> {
     let reference = Path::new(name);
     ensure!(
         !reference.is_absolute() && !name.contains(':'),
-        "不支持绝对纹理路径 {name}"
+        message!(absolute_texture_path_name_is_unsupported, name = name)
     );
     let path = file
         .parent()
-        .context("模型缺少父目录")?
+        .context(message!(missing_parent_folder_for_the_model))?
         .join(reference)
         .canonicalize()
-        .with_context(|| format!("找不到外部纹理 {name}"))?;
+        .with_context(|| message!(external_texture_name_was_not_found, name = name))?;
     ensure!(
         path.starts_with(root) && path.is_file(),
-        "外部纹理不在模型目录内：{name}"
+        message!(
+            external_texture_is_outside_the_model_folder_name,
+            name = name
+        )
     );
     Ok(path)
 }
@@ -235,7 +247,7 @@ impl Texture {
                     .read_to_end(&mut data)?;
                 ensure!(
                     data.len() as u64 <= MAX_ENCODED_BYTES,
-                    "外部纹理超出大小限制"
+                    message!(external_texture_exceeds_the_size_limit)
                 );
                 data
             }
@@ -247,7 +259,10 @@ impl Texture {
         let format = image::guess_format(bytes)?;
         ensure!(
             matches!(format, ImageFormat::Png | ImageFormat::Jpeg),
-            "不支持的纹理格式 {format:?}，需要 JPEG 或 PNG"
+            message!(
+                unsupported_texture_format_format_use_jpeg_or_png,
+                format = format
+            )
         );
         let mut limits = Limits::default();
         limits.max_image_width = Some(8192);
@@ -260,7 +275,7 @@ impl Texture {
         let (w, h) = decoder.dimensions();
         ensure!(
             u64::from(w) * u64::from(h) * 4 <= CACHE_BYTES as u64,
-            "解码纹理超出缓存容量"
+            message!(decoded_texture_exceeds_cache_capacity)
         );
         Ok(image::DynamicImage::from_decoder(decoder)?.into_rgba8())
     }
@@ -426,7 +441,10 @@ pub fn render(
     }
     ensure!(
         !block.heights.iter().any(|&z| z as f32 == NODATA),
-        "模型高程与 DSM NoData 值 {NODATA} 冲突"
+        message!(
+            model_elevation_conflicts_with_dsm_nodata_value_nodata,
+            NODATA = NODATA
+        )
     );
     Ok(block)
 }

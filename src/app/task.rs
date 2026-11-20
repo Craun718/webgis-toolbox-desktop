@@ -1,6 +1,6 @@
 use super::Outcome;
 use crate::console;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use std::{
     collections::VecDeque,
@@ -11,10 +11,16 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use webgis_core::{
+    i18n::{self, Language},
+    message,
+};
+use webgis_toolbox::dom::{Phase, TaskProgress};
 
 const LOG_LIMIT: usize = 2_000;
 
 struct Stage {
+    phase: Phase,
     name: String,
     fraction: Option<f32>,
     publishing: bool,
@@ -33,7 +39,8 @@ impl TaskState {
         let mut state = Self {
             name: name.into(),
             stage: Stage {
-                name: "准备任务".into(),
+                phase: Phase::Prepare,
+                name: message!(prepare_task).into(),
                 fraction: None,
                 publishing: false,
             },
@@ -41,7 +48,7 @@ impl TaskState {
             final_status: None,
             logs: VecDeque::new(),
         };
-        state.log(console::Level::Info, "任务开始");
+        state.log(console::Level::Info, message!(task_started));
         state
     }
 
@@ -53,9 +60,11 @@ impl TaskState {
             .push_back(console::record(level, &self.name, message));
     }
 
-    fn update(&mut self, name: String, fraction: Option<f32>, now: Instant) {
-        let changed = phase(&self.stage.name) != phase(&name);
-        self.stage.name = name;
+    fn update(&mut self, event: TaskProgress, now: Instant) {
+        let changed = self.stage.phase != event.phase;
+        self.stage.phase = event.phase;
+        self.stage.name = event.display.stage;
+        let fraction = event.display.fraction;
         self.stage.fraction = fraction;
         if changed
             || self
@@ -63,7 +72,7 @@ impl TaskState {
                 .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
         {
             let message = match fraction {
-                Some(fraction) => format!("{}（{:.0}%）", self.stage.name, fraction * 100.0),
+                Some(fraction) => message!(progress_percentage, self.stage.name, fraction * 100.0),
                 None => self.stage.name.clone(),
             };
             self.log(console::Level::Info, &message);
@@ -77,37 +86,29 @@ impl TaskState {
             && !self.stage.publishing
             && !control.cancelled.swap(true, Ordering::Relaxed)
         {
-            self.log(console::Level::Info, "已请求取消，等待后台任务退出");
+            self.log(console::Level::Info, message!(cancel_requested));
         }
     }
 
     fn finish(&mut self, result: &Result<Outcome>) {
         let (status, level) = match result {
-            Ok(Outcome::Cancelled) => ("任务已取消", console::Level::Info),
-            Ok(_) => ("任务已完成", console::Level::Info),
-            Err(_) => ("任务失败", console::Level::Error),
+            Ok(Outcome::Cancelled) => (message!(task_canceled), console::Level::Info),
+            Ok(_) => (message!(task_completed), console::Level::Info),
+            Err(_) => (message!(task_failed), console::Level::Error),
         };
         self.final_status = Some(status);
         match result {
-            Err(error) => self.log(level, &format!("{status}：{error:#}")),
+            Err(error) => self.log(
+                level,
+                &message!(status_error, status = status, error = error),
+            ),
             _ => self.log(level, status),
         }
     }
 }
 
-fn phase(name: &str) -> &str {
-    for prefix in ["读取模型 ", "栅格化 ", "裁剪 "] {
-        if name.starts_with(prefix) {
-            return prefix;
-        }
-    }
-    if name.starts_with("生成 ") && name.ends_with("级地图切片") {
-        return "生成地图切片";
-    }
-    name
-}
-
 struct TaskControl {
+    language: Language,
     cancellable: bool,
     cancelled: Arc<AtomicBool>,
     state: Mutex<TaskState>,
@@ -120,9 +121,9 @@ pub(super) struct TaskContext {
 }
 
 impl TaskContext {
-    pub(super) fn update(&self, name: impl Into<String>, fraction: Option<f32>) {
+    pub(super) fn update(&self, event: TaskProgress) {
         let mut state = self.control.state.lock().unwrap();
-        state.update(name.into(), fraction, Instant::now());
+        state.update(event, Instant::now());
         drop(state);
         self.egui.request_repaint_of(egui::ViewportId::ROOT);
     }
@@ -133,13 +134,17 @@ impl TaskContext {
 
     pub(super) fn publish_with_progress(&self, fraction: Option<f32>) -> Result<()> {
         let mut state = self.control.state.lock().unwrap();
-        ensure!(!self.cancelled.load(Ordering::Relaxed), "处理已取消");
+        ensure!(
+            !self.cancelled.load(Ordering::Relaxed),
+            message!(processing_canceled)
+        );
         state.stage = Stage {
-            name: "保存结果".into(),
+            phase: Phase::Publish,
+            name: message!(save_results).into(),
             fraction,
             publishing: true,
         };
-        state.log(console::Level::Info, "保存结果");
+        state.log(console::Level::Info, message!(save_results));
         drop(state);
         self.egui.request_repaint_of(egui::ViewportId::ROOT);
         Ok(())
@@ -159,7 +164,9 @@ impl Worker {
         work: impl FnOnce(&TaskContext) -> Result<Outcome> + Send + 'static,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
+        let language = i18n::language();
         let control = Arc::new(TaskControl {
+            language,
             cancellable,
             cancelled: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(TaskState::new(name)),
@@ -172,18 +179,21 @@ impl Worker {
         std::thread::Builder::new()
             .name("webgis-task".into())
             .spawn(move || {
-                let result = work(&task);
-                let mut state = task.control.state.lock().unwrap();
-                let result = if result.is_err() && task.cancelled.load(Ordering::Relaxed) {
-                    Ok(Outcome::Cancelled)
-                } else {
-                    result
-                };
-                state.finish(&result);
-                drop(state);
-                let _ = sender.send(result);
-                task.egui.request_repaint_of(egui::ViewportId::ROOT);
-            })?;
+                i18n::with_language(language, || {
+                    let result = work(&task);
+                    let mut state = task.control.state.lock().unwrap();
+                    let result = if result.is_err() && task.cancelled.load(Ordering::Relaxed) {
+                        Ok(Outcome::Cancelled)
+                    } else {
+                        result
+                    };
+                    state.finish(&result);
+                    drop(state);
+                    let _ = sender.send(result);
+                    task.egui.request_repaint_of(egui::ViewportId::ROOT);
+                })
+            })
+            .context(message!(could_not_start_the_background_worker))?;
         Ok(Self { control, receiver })
     }
 
@@ -194,18 +204,24 @@ impl Worker {
         }
     }
 
+    pub(super) fn language(&self) -> Language {
+        self.control.language
+    }
+
     pub(super) fn finish_disconnected(&self, result: &Result<Outcome>) {
-        self.control.state.lock().unwrap().finish(result);
+        i18n::with_language(self.language(), || {
+            self.control.state.lock().unwrap().finish(result)
+        });
     }
 
     pub(super) fn close_notice(&self) -> &'static str {
         let state = self.control.state.lock().unwrap();
         if self.control.cancelled.load(Ordering::Relaxed) {
-            "请等待任务取消完成后再关闭窗口。"
+            message!(wait_for_cancel_before_closing)
         } else if self.control.cancellable && !state.stage.publishing {
-            "请先点击主界面的『取消任务』，等待任务停止后再关闭窗口。"
+            message!(cancel_before_closing)
         } else {
-            "请等待当前任务结束后再关闭窗口。"
+            message!(wait_for_task_before_closing)
         }
     }
 
@@ -216,7 +232,7 @@ impl Worker {
                 && !state.stage.publishing
                 && !self.control.cancelled.load(Ordering::Relaxed);
             if ui
-                .add_enabled(enabled, egui::Button::new("取消任务"))
+                .add_enabled(enabled, egui::Button::new(message!(cancel_task)))
                 .clicked()
             {
                 state.request_cancel(&self.control);
@@ -251,10 +267,12 @@ impl TaskWindow {
 
                 let mut close = false;
                 let content = |ui: &mut egui::Ui| {
-                    close = self.content(ui, busy);
+                    close = i18n::with_language(self.control.language, || self.content(ui, busy));
                 };
                 if class == egui::ViewportClass::Embedded {
-                    egui::Window::new(&title).show(ctx, content);
+                    egui::Window::new(&title)
+                        .id(egui::Id::new(self.id))
+                        .show(ctx, content);
                 } else {
                     egui::CentralPanel::default().show(ctx, content);
                 }
@@ -282,14 +300,17 @@ impl TaskWindow {
         };
         let mut close = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(status.unwrap_or(if pending { "正在取消" } else { &stage }));
+            ui.label(status.unwrap_or(if pending { message!(canceling) } else { &stage }));
             if status.is_none() && fraction.is_none() {
                 ui.spinner();
             }
             if status.is_none() {
                 if self.control.cancellable {
                     if ui
-                        .add_enabled(!publishing && !pending, egui::Button::new("取消任务"))
+                        .add_enabled(
+                            !publishing && !pending,
+                            egui::Button::new(message!(cancel_task)),
+                        )
                         .clicked()
                     {
                         self.control
@@ -300,12 +321,14 @@ impl TaskWindow {
                         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                     }
                 } else {
-                    ui.weak("当前任务不支持取消");
+                    ui.weak(message!(this_task_cannot_be_canceled));
                 }
             } else {
-                close = ui.add_enabled(!busy, egui::Button::new("关闭")).clicked();
+                close = ui
+                    .add_enabled(!busy, egui::Button::new(message!(close)))
+                    .clicked();
             }
-            if ui.button("复制日志").clicked() {
+            if ui.button(message!(copy_log)).clicked() {
                 ui.ctx().copy_text(log.clone());
             }
         });
@@ -357,29 +380,28 @@ mod tests {
     fn progress_logs_on_phase_change_and_at_most_once_per_second_within_a_phase() {
         let mut state = TaskState::new("处理");
         let start = Instant::now();
-        state.update("读取模型 a.osgb".into(), Some(0.0), start);
         state.update(
-            "读取模型 b.osgb".into(),
-            Some(0.4),
+            TaskProgress::new(Phase::ReadModel, "读取模型 a.osgb", Some(0.0)),
+            start,
+        );
+        state.update(
+            TaskProgress::new(Phase::ReadModel, "Different display text", Some(0.4)),
             start + Duration::from_millis(999),
         );
         assert_eq!(state.logs.len(), 2);
-        assert_eq!(state.stage.name, "读取模型 b.osgb");
+        assert_eq!(state.stage.name, "Different display text");
         assert_eq!(state.stage.fraction, Some(0.4));
 
         state.update(
-            "读取模型 c.osgb".into(),
-            Some(0.5),
+            TaskProgress::new(Phase::ReadModel, "读取模型 c.osgb", Some(0.5)),
             start + Duration::from_secs(1),
         );
         state.update(
-            "栅格化 1/2 块".into(),
-            Some(0.5),
+            TaskProgress::new(Phase::Rasterize, "栅格化 1/2 块", Some(0.5)),
             start + Duration::from_millis(1001),
         );
         state.update(
-            "栅格化 2/2 块".into(),
-            Some(1.0),
+            TaskProgress::new(Phase::Rasterize, "栅格化 2/2 块", Some(1.0)),
             start + Duration::from_millis(1002),
         );
         assert_eq!(state.logs.len(), 4);
@@ -453,6 +475,73 @@ mod tests {
         );
         let state = worker.control.state.lock().unwrap();
         assert!(state.logs[2].ends_with("任务已完成"));
+    }
+
+    #[test]
+    fn task_language_reaches_serial_and_parallel_processing_and_the_log() {
+        use std::path::Path;
+        use webgis_core::task_pool::{self, ThreadPoolBuilder};
+        use webgis_toolbox::dom::cog;
+
+        for (language, title, expected) in [
+            (
+                Language::English,
+                "Create COG",
+                "Input must be a .tif or .tiff file",
+            ),
+            (
+                Language::Japanese,
+                "COG の作成",
+                "入力は .tif または .tiff ファイルである必要があります",
+            ),
+        ] {
+            let (release, wait) = mpsc::channel();
+            let worker = i18n::with_language(language, || {
+                Worker::start(&egui::Context::default(), title, true, move |task| {
+                    wait.recv_timeout(Duration::from_secs(5))?;
+                    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+                    let validate = |()| {
+                        let error = cog::run(
+                            Path::new("bad.jpg"),
+                            Path::new("result.tif"),
+                            &task.cancelled,
+                            |_| {},
+                            || Ok(()),
+                        )
+                        .unwrap_err();
+                        assert_eq!(error.to_string(), expected);
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    task_pool::map(None, vec![()], validate)?;
+                    task_pool::map(Some(&pool), vec![(), ()], validate)?;
+                    task_pool::map_with(Some(&pool), vec![(), ()], &mut [(), ()], |item, _| {
+                        validate(item)
+                    })?;
+                    task.update(TaskProgress::new(
+                        Phase::ReadGeoTiff,
+                        message!(read_geotiff),
+                        Some(0.0),
+                    ));
+                    bail!(expected);
+                })
+            })
+            .unwrap();
+
+            assert_eq!(i18n::language(), Language::Chinese);
+            release.send(()).unwrap();
+            let result = worker
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(result.err().unwrap().to_string(), expected);
+            let state = worker.control.state.lock().unwrap();
+            assert_eq!(state.logs.len(), 3);
+            assert!(
+                state.logs[1].contains(i18n::with_language(language, || message!(read_geotiff)))
+            );
+            assert!(state.logs[2].contains(title));
+            assert!(state.logs[2].ends_with(expected));
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result, ensure};
@@ -37,7 +38,7 @@ pub fn parse_background(value: &str) -> Result<[u8; 3]> {
     let hex = value.strip_prefix('#').unwrap_or_default();
     ensure!(
         hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "背景颜色必须是 #RRGGBB"
+        message!(background_color_must_use_rrggbb)
     );
     Ok([
         u8::from_str_radix(&hex[..2], 16)?,
@@ -51,8 +52,14 @@ pub fn parse_zooms(value: &str) -> Result<BTreeSet<u8>> {
         let zoom: u8 = value
             .trim()
             .parse()
-            .with_context(|| format!("无效级别 {value:?}"))?;
-        ensure!(zoom <= MAX_ZOOM, "级别必须在 0–{MAX_ZOOM} 范围内");
+            .with_context(|| message!(invalid_zoom_level_value, value = value))?;
+        ensure!(
+            zoom <= MAX_ZOOM,
+            message!(
+                zoom_levels_must_be_in_the_range_0_max_zoom,
+                MAX_ZOOM = MAX_ZOOM
+            )
+        );
         Ok(zoom)
     }
 
@@ -60,7 +67,10 @@ pub fn parse_zooms(value: &str) -> Result<BTreeSet<u8>> {
     for item in value.split(',') {
         if let Some((start, end)) = item.split_once('-') {
             let (start, end) = (parse(start)?, parse(end)?);
-            ensure!(start <= end, "级别范围反向：{item}");
+            ensure!(
+                start <= end,
+                message!(reversed_zoom_range_item, item = item)
+            );
             zooms.extend(start..=end);
         } else {
             zooms.insert(parse(item)?);
@@ -106,9 +116,8 @@ pub fn run_with_publish(
             let expected_bands = if options.format == Format::Jpeg { 3 } else { 4 };
             if tile.format == options.format && decoded.bands == Some(expected_bands) {
                 make_parent(&out)?;
-                fs::copy(&tile.path, &out).with_context(|| {
-                    format!("复制 {} 到 {}", tile.path.display(), out.display())
-                })?;
+                fs::copy(&tile.path, &out)
+                    .with_context(|| message!(copy_to, tile.path.display(), out.display()))?;
             } else {
                 encode(&out, &decoded.image.into_rgba8(), options)?;
             }
@@ -175,7 +184,7 @@ pub fn run_with_publish(
 fn encode(path: &Path, image: &RgbaImage, options: &Options) -> Result<()> {
     make_parent(path)?;
     let mut writer =
-        BufWriter::new(File::create(path).with_context(|| format!("创建 {}", path.display()))?);
+        BufWriter::new(File::create(path).with_context(|| message!(create, path.display()))?);
     let (w, h) = image.dimensions();
     match options.format {
         Format::Png => {
@@ -206,10 +215,10 @@ fn encode(path: &Path, image: &RgbaImage, options: &Options) -> Result<()> {
             )
         }
     }
-    .with_context(|| format!("编码 {}", path.display()))?;
+    .with_context(|| message!(encode, path.display()))?;
     writer
         .flush()
-        .with_context(|| format!("写入 {}", path.display()))
+        .with_context(|| message!(write, path.display()))
 }
 
 struct Source<'a> {

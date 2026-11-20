@@ -1,4 +1,7 @@
-use super::{check_cancelled, tiff_output::TILE, tiff_source::Source, tile_sampling::Grid};
+use super::{
+    Phase, TaskProgress, check_cancelled, tiff_output::TILE, tiff_source::Source,
+    tile_sampling::Grid,
+};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, FixedOffset};
 use image::RgbaImage;
@@ -7,6 +10,7 @@ use tiles_toolbox::{
     stacta,
     tiles::{Bounds, HALF_WORLD, publish_directory, relative_path, tile_span},
 };
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 
 pub const MAX_ZOOM: u8 = 23;
@@ -36,31 +40,52 @@ pub fn run_with_pool(
     publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<u8>> {
+    run_with_progress(
+        request,
+        cancelled,
+        |event| progress(event.display.stage, event.display.fraction),
+        publish,
+        pool,
+    )
+}
+
+pub fn run_with_progress(
+    request: &Request,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(TaskProgress),
+    publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
+) -> Result<Vec<u8>> {
     ensure!(
         request.min_zoom <= request.max_zoom,
-        "最小级别不能大于最大级别"
+        message!(minimum_zoom_cannot_exceed_maximum_zoom)
     );
-    ensure!(request.max_zoom <= MAX_ZOOM, "级别须在 0–{MAX_ZOOM} 之间");
+    ensure!(
+        request.max_zoom <= MAX_ZOOM,
+        message!(zoom_must_be_between_0_and_max_zoom, MAX_ZOOM = MAX_ZOOM)
+    );
     ensure!(
         request
             .input
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")),
-        "请选择 .tif 或 .tiff 文件"
+        message!(select_a_tif_or_tiff_file)
     );
     check_cancelled(cancelled)?;
     let source = Source::open(&request.input)
-        .with_context(|| format!("读取 {} 失败", request.input.display()))?;
+        .with_context(|| message!(could_not_read, request.input.display()))?;
     let grid = Grid::new(&source)?;
     let bounds = grid
         .bounds(source.size)
-        .with_context(|| format!("投影 {} 的覆盖范围失败", request.input.display()))?;
+        .with_context(|| message!(could_not_project_the_extent_of, request.input.display()))?;
     let id = request
         .id
         .as_deref()
         .or_else(|| request.output.file_name().and_then(|name| name.to_str()))
         .filter(|value| !value.trim().is_empty())
-        .context("无法从输出目录推导 STAC ID，请填写 ID")?;
+        .context(message!(
+            could_not_infer_the_stac_id_from_the_output_folder_enter_an_id
+        ))?;
     let zoom_ranges: Vec<_> = (request.min_zoom..=request.max_zoom)
         .map(|zoom| (zoom, candidate_ranges(&bounds, zoom)))
         .collect();
@@ -78,7 +103,11 @@ pub fn run_with_pool(
         let mut readers: Vec<_> = (0..task_pool::width(pool)).map(|_| None).collect();
         let buffer = || RgbaImage::new(TILE as u32, TILE as u32);
         readers[0] = Some((source, grid, buffer()));
-        progress("生成地图切片".into(), Some(0.0));
+        progress(TaskProgress::new(
+            Phase::GenerateTiles,
+            message!(generate_map_tiles),
+            Some(0.0),
+        ));
         for (zoom, candidates) in zoom_ranges {
             let span = tile_span(zoom);
             let pixel = span / TILE as f64;
@@ -92,7 +121,7 @@ pub fn run_with_pool(
                     check_cancelled(cancelled)?;
                     if reader.is_none() {
                         let source = Source::open(&request.input)
-                            .with_context(|| format!("读取 {} 失败", request.input.display()))?;
+                            .with_context(|| message!(could_not_read, request.input.display()))?;
                         let grid = Grid::new(&source)?;
                         *reader = Some((source, grid, buffer()));
                     }
@@ -102,7 +131,13 @@ pub fn run_with_pool(
                     let valid = grid
                         .render(source, rgba, [left, top], pixel, cancelled)
                         .with_context(|| {
-                            format!("采样 {} 的 {zoom}/{x}/{y} 失败", request.input.display())
+                            message!(
+                                could_not_sample_at_zoom_x_y,
+                                request.input.display(),
+                                zoom = zoom,
+                                x = x,
+                                y = y
+                            )
                         })?;
                     Ok::<_, anyhow::Error>((x, y, valid))
                 })?;
@@ -113,7 +148,7 @@ pub fn run_with_pool(
                         let path = staging.join(relative_path(zoom, x, y, "png"));
                         tiles_toolbox::tiles::make_parent(&path)?;
                         rgba.save(&path)
-                            .with_context(|| format!("写入瓦片 {}", path.display()))?;
+                            .with_context(|| message!(write_tile, path.display()))?;
                         coverage
                             .get_or_insert(Bounds {
                                 min_x: x,
@@ -125,10 +160,11 @@ pub fn run_with_pool(
                     }
                     visited += 1;
                     if visited.is_multiple_of(32) || visited == total {
-                        progress(
-                            format!("生成 {zoom} 级地图切片"),
+                        progress(TaskProgress::new(
+                            Phase::GenerateTiles,
+                            message!(generate_map_tiles_at_zoom, zoom = zoom),
                             Some(0.85 * (visited as f32 / total as f32)),
-                        );
+                        ));
                     }
                 }
             }
@@ -139,10 +175,13 @@ pub fn run_with_pool(
         check_cancelled(cancelled)?;
         ensure!(
             !levels.is_empty(),
-            "{} 没有有效瓦片",
-            request.input.display()
+            message!(contains_no_valid_tiles, request.input.display())
         );
-        progress("生成 STACTA 索引".into(), Some(0.90));
+        progress(TaskProgress::new(
+            Phase::IndexTiles,
+            message!(generate_stacta_index),
+            Some(0.90),
+        ));
         stacta::write_rgba_png(
             staging,
             id,

@@ -1,4 +1,5 @@
 use super::{Boundary, Reference, osgb, vector};
+use crate::message;
 use crate::task_pool::{self, ThreadPool};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -70,7 +71,10 @@ pub fn preflight_cancelable(
             ensure_input(&prepared.root, &resolve_reference(entry, name)?)?;
         }
         if prepared.single && !scene.pages.is_empty() {
-            return Err(format!("{} 含外部分页，请选择模型目录", file.display()));
+            return Err(message!(
+                contains_external_pages_select_the_model_folder,
+                file.display()
+            ));
         }
     }
     check_cancelled(cancelled)?;
@@ -99,7 +103,7 @@ pub fn run_with_pool(
     let output = &prepared.summary.output;
     let existing = output_non_empty(output)?;
     if existing == Some(true) && !request.allow_non_empty_output {
-        return Err("输出目录非空，请确认后再开始裁剪".into());
+        return Err(message!(the_output_folder_is_not_empty_confirm_before_clipping).into());
     }
     let staging = tempfile::Builder::new()
         .prefix(".osgb-clip-")
@@ -116,7 +120,7 @@ pub fn run_with_pool(
     let mut completed = 0;
     let mut triangles = 0;
     if seen.contains(Path::new("metadata.xml")) {
-        return Err("模型入口与 metadata.xml 冲突".into());
+        return Err(message!(model_entry_conflicts_with_metadata_xml).into());
     }
     write_file(&stage.join("metadata.xml"), &prepared.metadata)?;
     while !pending.is_empty() {
@@ -135,27 +139,34 @@ pub fn run_with_pool(
             let input = fs::read(&file).map_err(|err| file_error(&file, err))?;
             let clipped =
                 osgb::rewrite_cancelable(&input, Some(&prepared.boundary), Some(cancelled))
-                    .map_err(|err| file_error(&file, err))?;
+                    .map_err(|err| message!(clip_osgb_failed, file_error(&file, err)))?;
             let verified = osgb::inspect(&clipped.bytes, Some(cancelled))
                 .map_err(|err| file_error(&file, err))?;
             if verified.triangles != clipped.info.triangles
                 || verified.pages != clipped.info.pages
                 || verified.textures != clipped.info.textures
             {
-                return Err(format!("输出校验失败：{}", file.display()));
+                return Err(message!(output_validation_failed, file.display()));
             }
             Ok((relative, file, clipped))
         })?;
         for (relative, file, clipped) in models {
             check_cancelled(cancelled)?;
             if prepared.single && !clipped.info.pages.is_empty() {
-                return Err(format!("{} 含外部分页，请选择模型目录", file.display()));
+                return Err(message!(
+                    contains_external_pages_select_the_model_folder,
+                    file.display()
+                ));
             }
             for name in &clipped.info.pages {
                 let path =
                     resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
                 if vector::extension(&path) != "osgb" {
-                    return Err(format!("{} 引用了非 OSGB 分页 {name}", file.display()));
+                    return Err(message!(
+                        references_a_non_osgb_page_name,
+                        file.display(),
+                        name = name
+                    ));
                 }
                 if seen.insert(path.clone()) {
                     pending.push_back(path);
@@ -166,9 +177,10 @@ pub fn run_with_pool(
                 let path =
                     resolve_reference(&relative, name).map_err(|err| file_error(&file, err))?;
                 if vector::extension(&path) == "osgb" || path == Path::new("metadata.xml") {
-                    return Err(format!(
-                        "{} 的纹理路径与模型或元数据冲突：{name}",
-                        file.display()
+                    return Err(message!(
+                        texture_path_in_conflicts_with_a_model_or_metadata_file_name,
+                        file.display(),
+                        name = name
                     ));
                 }
                 if textures.insert(path.clone()) {
@@ -184,7 +196,7 @@ pub fn run_with_pool(
                         .map_err(|err| file_error(&target, err))?;
                     if io::copy(&mut input, &mut out).map_err(|err| file_error(&target, err))? == 0
                     {
-                        return Err(format!("纹理文件为空：{}", source.display()));
+                        return Err(message!(texture_file_is_empty, source.display()));
                     }
                 }
             }
@@ -200,13 +212,13 @@ pub fn run_with_pool(
     }
     check_cancelled(cancelled)?;
     if triangles == 0 {
-        return Err("模型与裁剪范围没有交集".into());
+        return Err(message!(the_model_does_not_intersect_the_clip_boundary).into());
     }
     before_publish()?;
     if existing.is_some() {
         let non_empty = directory_has_entries(output, Some(stage))?;
         if non_empty && !request.allow_non_empty_output {
-            return Err("输出目录非空，请确认后再开始裁剪".into());
+            return Err(message!(the_output_folder_is_not_empty_confirm_before_clipping).into());
         }
         publish_into_existing(stage, output)?;
     } else {
@@ -242,7 +254,7 @@ fn prepare(request: &Request) -> Result<Prepared, String> {
                 vec![
                     entry
                         .strip_prefix(&model)
-                        .map_err(|_| "瓦片入口必须位于模型目录内")?
+                        .map_err(|_| message!(the_tile_entry_must_be_within_the_model_folder))?
                         .to_path_buf(),
                 ]
             }
@@ -251,23 +263,29 @@ fn prepare(request: &Request) -> Result<Prepared, String> {
         (model, entries, reference, metadata, false)
     } else {
         if !model.is_file() || vector::extension(&model) != "osgb" {
-            return Err("请选择 OSGB 文件或包含 metadata.xml 的模型目录".into());
+            return Err(
+                message!(select_an_osgb_file_or_a_model_folder_containing_metadata_xml).into(),
+            );
         }
-        let reference = request
-            .reference
-            .clone()
-            .ok_or("单文件模式需要填写模型坐标系与 XYZ 原点")?;
+        let reference = request.reference.clone().ok_or(message!(
+            single_file_mode_requires_the_model_crs_and_xyz_origin
+        ))?;
         let metadata = reference.xml().into_bytes();
-        let root = model.parent().ok_or("模型没有父目录")?.to_path_buf();
-        let entries = vec![PathBuf::from(model.file_name().ok_or("模型没有文件名")?)];
+        let root = model
+            .parent()
+            .ok_or(message!(model_has_no_parent_folder))?
+            .to_path_buf();
+        let entries = vec![PathBuf::from(
+            model.file_name().ok_or(message!(model_has_no_file_name))?,
+        )];
         (root, entries, reference, metadata, true)
     };
     if entries.iter().any(|path| vector::extension(path) != "osgb") {
-        return Err("瓦片入口必须为 OSGB 文件".into());
+        return Err(message!(the_tile_entry_must_be_an_osgb_file).into());
     }
     let output = output_path(&request.output)?;
     if !single && output.starts_with(&root) {
-        return Err("请将裁剪结果保存到模型目录之外".into());
+        return Err(message!(save_the_clipped_outputs_outside_the_model_folder).into());
     }
     let (polygons, source) = vector::read(
         &request.boundary,
@@ -293,12 +311,17 @@ fn prepare(request: &Request) -> Result<Prepared, String> {
 
 fn output_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err("输出位置需要为绝对路径".into());
+        return Err(message!(output_location_must_be_an_absolute_path).into());
     }
-    let name = path.file_name().ok_or("请输入新输出目录名称")?;
-    let parent = real_path(path.parent().ok_or("输出位置缺少父目录")?)?;
+    let name = path
+        .file_name()
+        .ok_or(message!(enter_a_name_for_the_new_output_folder))?;
+    let parent = real_path(
+        path.parent()
+            .ok_or(message!(output_location_has_no_parent_folder))?,
+    )?;
     if !parent.is_dir() {
-        return Err("输出位置的父路径不是目录".into());
+        return Err(message!(the_parent_of_the_output_path_is_not_a_folder).into());
     }
     Ok(parent.join(name))
 }
@@ -306,7 +329,10 @@ fn output_path(path: &Path) -> Result<PathBuf, String> {
 fn output_non_empty(path: &Path) -> Result<Option<bool>, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => directory_has_entries(path, None).map(Some),
-        Ok(_) => Err(format!("输出路径已存在且不是普通目录：{}", path.display())),
+        Ok(_) => Err(message!(
+            output_path_exists_and_is_not_a_regular_folder,
+            path.display()
+        )),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(file_error(path, err)),
     }
@@ -325,7 +351,10 @@ fn directory_has_entries(path: &Path, ignored: Option<&Path>) -> Result<bool, St
 
 fn output_error(path: &Path, err: io::Error) -> String {
     if err.kind() == io::ErrorKind::AlreadyExists || path.symlink_metadata().is_ok() {
-        format!("输出位置已存在，请更换位置：{}", path.display())
+        message!(
+            output_location_already_exists_choose_another_location,
+            path.display()
+        )
     } else {
         file_error(path, err)
     }
@@ -348,9 +377,10 @@ fn publish_into_existing(stage: &Path, output: &Path) -> Result<(), String> {
             }
         }
         if !cleanup_errors.is_empty() {
-            return Err(format!(
-                "{err}。部分输出清理失败：{}",
-                cleanup_errors.join("；")
+            return Err(message!(
+                err_could_not_clean_up_some_outputs,
+                cleanup_errors.join("；"),
+                err = err
             ));
         }
         return Err(err);
@@ -419,7 +449,12 @@ fn auto_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
     match top.as_slice() {
         [entry] => return Ok(vec![entry.strip_prefix(root).unwrap().into()]),
         [] => {}
-        _ => return Err("目录存在多个顶级 OSGB，请手动选择瓦片入口".into()),
+        _ => {
+            return Err(message!(
+                the_folder_contains_multiple_top_level_osgb_files_select_the_tile_entry_manually
+            )
+            .into());
+        }
     }
     let data_dir = root.join("Data");
     let folders = if data_dir.is_dir() {
@@ -442,7 +477,7 @@ fn auto_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     if tiles.is_empty() {
-        return Err("未找到标准瓦片入口，请手动选择 OSGB 文件".into());
+        return Err(message!(no_standard_tile_entry_found_choose_an_osgb_file_manually).into());
     }
     tiles.sort_unstable();
     Ok(tiles)
@@ -461,7 +496,10 @@ fn list_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn resolve_reference(scene: &Path, name: &str) -> Result<PathBuf, String> {
     if name.is_empty() || name.contains([':', '\0']) {
-        return Err(format!("不支持的外部引用路径 {name}"));
+        return Err(message!(
+            unsupported_external_reference_path_name,
+            name = name
+        ));
     }
     let mut path = scene.parent().unwrap_or(Path::new("")).to_path_buf();
     for part in Path::new(name).components() {
@@ -469,11 +507,16 @@ fn resolve_reference(scene: &Path, name: &str) -> Result<PathBuf, String> {
             Component::Normal(part) => path.push(part),
             Component::CurDir => {}
             Component::ParentDir if path.pop() => {}
-            _ => return Err(format!("外部引用超出输入目录：{name}")),
+            _ => {
+                return Err(message!(
+                    external_reference_is_outside_the_input_folder_name,
+                    name = name
+                ));
+            }
         }
     }
     if path.as_os_str().is_empty() {
-        return Err(format!("无效外部引用：{name}"));
+        return Err(message!(invalid_external_reference_name, name = name));
     }
     Ok(path)
 }
@@ -482,8 +525,8 @@ fn ensure_input(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     let candidate = root.join(relative);
     let real = real_path(&candidate)?;
     if !real.starts_with(root) || !real.is_file() {
-        return Err(format!(
-            "输入依赖不是模型目录内的文件：{}",
+        return Err(message!(
+            input_dependency_is_not_a_file_within_the_model_folder,
             candidate.display()
         ));
     }
@@ -501,7 +544,8 @@ fn read_scene(
 ) -> Result<(PathBuf, osgb::SceneInfo), String> {
     let file = ensure_input(root, entry)?;
     let bytes = fs::read(&file).map_err(|err| file_error(&file, err))?;
-    let scene = osgb::inspect(&bytes, Some(cancelled)).map_err(|err| file_error(&file, err))?;
+    let scene = osgb::inspect(&bytes, Some(cancelled))
+        .map_err(|err| message!(read_osgb_failed, file_error(&file, err)))?;
     Ok((file, scene))
 }
 
@@ -521,12 +565,12 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn file_error(path: &Path, err: impl std::fmt::Display) -> String {
-    format!("{}：{err}", path.display())
+    message!(path_error, path.display(), err)
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
-        return Err("裁剪已取消".into());
+        return Err(message!(clipping_canceled).into());
     }
     Ok(())
 }

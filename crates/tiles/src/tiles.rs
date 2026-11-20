@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+use webgis_core::message;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
@@ -84,7 +85,7 @@ impl Tile {
 
     pub fn decode(&self, expected_size: Option<u32>) -> Result<Decoded> {
         self.decode_inner(expected_size)
-            .with_context(|| format!("读取切片 {}", self.path.display()))
+            .with_context(|| message!(read_tile, self.path.display()))
     }
 
     fn decode_inner(&self, expected_size: Option<u32>) -> Result<Decoded> {
@@ -92,7 +93,7 @@ impl Tile {
         let header = reader.fill_buf()?;
         ensure!(
             image::guess_format(header)? == self.format.image_format(),
-            "实际图像格式与扩展名不匹配"
+            message!(image_format_does_not_match_the_file_extension)
         );
         let png_bands = if self.format == Format::Png && header.get(24) == Some(&8) {
             match header.get(25) {
@@ -114,15 +115,17 @@ impl Tile {
         let (w, h) = decoder.dimensions();
         ensure!(
             w == h && (16..=4096).contains(&w) && w.is_multiple_of(16),
-            "切片必须是边长为 16 的倍数且不超过 4096 的方形，实际为 {w}×{h}"
-        );
+            message!(tiles_must_be_square_with_sides_that_are_multiples_of_16_and_at_most_4096_pixels_found_w_h, w = w, h = h));
         if let Some(size) = expected_size {
-            ensure!(size == w, "切片边长应为 {size}，实际为 {w}");
+            ensure!(
+                size == w,
+                message!(expected_tile_side_length_size_found_w, size = size, w = w)
+            );
         }
         let color = decoder.color_type();
         ensure!(
             color.bits_per_pixel() == u16::from(color.channel_count()) * 8,
-            "仅支持 8 位影像"
+            message!(only_8_bit_images_are_supported)
         );
         let bands = if self.format == Format::Png {
             png_bands
@@ -149,14 +152,17 @@ impl Index {
             let Some(z) = coordinate_directory(&z_dir)? else {
                 continue;
             };
-            ensure!(z <= u32::from(MAX_ZOOM), "级别越界：{}", z_dir.display());
+            ensure!(
+                z <= u32::from(MAX_ZOOM),
+                message!(zoom_level_out_of_bounds, z_dir.display())
+            );
             let zoom = z as u8;
             let count = 1 << zoom;
             for x_dir in directories(&z_dir)? {
                 let Some(x) = coordinate_directory(&x_dir)? else {
                     continue;
                 };
-                ensure!(x < count, "列号越界：{}", x_dir.display());
+                ensure!(x < count, message!(column_out_of_range, x_dir.display()));
                 for entry in read_dir(&x_dir)? {
                     let path = entry?.path();
                     let Some(format) = path
@@ -166,22 +172,22 @@ impl Index {
                     else {
                         continue;
                     };
-                    ensure!(path.is_file(), "切片不是文件：{}", path.display());
+                    ensure!(path.is_file(), message!(tile_is_not_a_file, path.display()));
                     let row = parse_coordinate(
                         path.file_stem()
                             .and_then(|stem| stem.to_str())
                             .unwrap_or_default(),
                         &path,
                     )?;
-                    ensure!(row < count, "行号越界：{}", path.display());
+                    ensure!(row < count, message!(row_out_of_range, path.display()));
                     let coord = (x, scheme.row(zoom, row));
                     let level = levels.entry(zoom).or_default();
                     if let Some(previous) = level.get(&coord) {
-                        bail!(
-                            "重复坐标：{} 与 {}",
+                        bail!(message!(
+                            duplicate_coordinates_and,
                             previous.path.display(),
                             path.display()
-                        );
+                        ));
                     }
                     level.insert(coord, Tile { path, format });
                 }
@@ -189,8 +195,7 @@ impl Index {
         }
         ensure!(
             !levels.is_empty(),
-            "未找到 z/x/y.ext 切片：{}",
-            root.display()
+            message!(no_z_x_y_ext_tiles_found, root.display())
         );
         Ok(Self(levels))
     }
@@ -198,12 +203,12 @@ impl Index {
     pub fn level(&self, zoom: u8) -> Result<&Level> {
         self.0
             .get(&zoom)
-            .with_context(|| format!("源目录没有级别 {zoom} 的切片"))
+            .with_context(|| message!(input_folder_has_no_tiles_at_zoom_zoom, zoom = zoom))
     }
 }
 
 fn read_dir(path: &Path) -> Result<fs::ReadDir> {
-    fs::read_dir(path).with_context(|| format!("读取目录 {}", path.display()))
+    fs::read_dir(path).with_context(|| message!(read_folder, path.display()))
 }
 
 fn directories(path: &Path) -> Result<Vec<PathBuf>> {
@@ -233,12 +238,11 @@ fn coordinate_directory(path: &Path) -> Result<Option<u32>> {
 fn parse_coordinate(value: &str, path: &Path) -> Result<u32> {
     ensure!(
         !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
-        "无效坐标：{}",
-        path.display()
+        message!(invalid_coordinate, path.display())
     );
     value
         .parse()
-        .with_context(|| format!("坐标越界：{}", path.display()))
+        .with_context(|| message!(coordinates_out_of_bounds, path.display()))
 }
 
 #[derive(Clone, Copy)]
@@ -282,7 +286,8 @@ pub fn relative_path(zoom: u8, x: u32, row: u32, ext: &str) -> PathBuf {
 }
 
 pub fn make_parent(path: &Path) -> Result<()> {
-    fs::create_dir_all(parent(path)).with_context(|| format!("创建目录 {}", parent(path).display()))
+    fs::create_dir_all(parent(path))
+        .with_context(|| message!(create_folder, parent(path).display()))
 }
 
 fn parent(path: &Path) -> &Path {
@@ -293,31 +298,31 @@ fn parent(path: &Path) -> &Path {
 
 fn ensure_absent(path: &Path) -> Result<()> {
     match path.symlink_metadata() {
-        Ok(_) => bail!("目标已存在：{}", path.display()),
+        Ok(_) => bail!(message!(destination_already_exists, path.display())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("检查目标 {}", path.display())),
+        Err(err) => Err(err).with_context(|| message!(inspect_destination, path.display())),
     }
 }
 
 pub fn publish_file(output: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
     ensure_absent(output)?;
     let mut temp = NamedTempFile::new_in(parent(output))
-        .with_context(|| format!("在 {} 创建临时文件", parent(output).display()))?;
-    write(temp.as_file_mut()).with_context(|| format!("写入 {}", output.display()))?;
+        .with_context(|| message!(create_temporary_file_in, parent(output).display()))?;
+    write(temp.as_file_mut()).with_context(|| message!(write, output.display()))?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(output)
         .map_err(|error| error.error)
-        .with_context(|| format!("发布 {}", output.display()))?;
+        .with_context(|| message!(publish, output.display()))?;
     Ok(())
 }
 
 pub fn publish_directory(output: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     ensure_absent(output)?;
     let temp = tempdir_in(parent(output))
-        .with_context(|| format!("在 {} 创建临时目录", parent(output).display()))?;
-    write(temp.path()).with_context(|| format!("写入 {}", output.display()))?;
+        .with_context(|| message!(create_temporary_folder_in, parent(output).display()))?;
+    write(temp.path()).with_context(|| message!(write, output.display()))?;
     rename_directory(temp.path(), output)
-        .with_context(|| format!("发布 {}（目标必须不存在）", output.display()))?;
+        .with_context(|| message!(publish_the_destination_must_not_exist, output.display()))?;
     let _ = temp.keep();
     Ok(())
 }
@@ -349,7 +354,7 @@ fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
 fn rename_directory(_from: &Path, _to: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "当前平台不支持无覆盖的原子目录发布",
+        message!(this_platform_does_not_support_atomic_folder_publishing_without_overwrite),
     ))
 }
 

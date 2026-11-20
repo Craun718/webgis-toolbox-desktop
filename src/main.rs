@@ -1,15 +1,25 @@
+use webgis_core::{i18n::with_language, message};
 mod app;
 mod console;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    console::record(console::Level::Info, "WebGIS 工具箱", "启动软件");
+    with_language(app::startup_language(), run)
+}
+
+fn run() -> eframe::Result {
+    console::record(
+        console::Level::Info,
+        message!(webgis_toolbox),
+        message!(application_started),
+    );
     let result = eframe::run_native(
-        "WebGIS 工具箱",
+        "webgis-toolbox",
         eframe::NativeOptions {
             renderer: eframe::Renderer::Glow,
             viewport: egui::ViewportBuilder::default()
+                .with_title(message!(webgis_toolbox))
                 .with_inner_size([960., 720.])
                 .with_min_inner_size([660., 500.]),
             ..Default::default()
@@ -17,15 +27,21 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx)))),
     );
     match &result {
-        Ok(()) => console::record(console::Level::Info, "WebGIS 工具箱", "退出软件"),
+        Ok(()) => with_language(app::startup_language(), || {
+            console::record(
+                console::Level::Info,
+                message!(webgis_toolbox),
+                message!(application_exited),
+            )
+        }),
         Err(error) => {
-            let mut message = format!("启动失败：{error}");
+            let mut message = message!(application_failed_to_start_error, error = error);
             let mut cause = std::error::Error::source(error);
             while let Some(error) = cause {
-                message.push_str(&format!("：{error}"));
+                message.push_str(&message!(error_cause, error));
                 cause = error.source();
             }
-            console::record(console::Level::Error, "WebGIS 工具箱", &message)
+            console::record(console::Level::Error, message!(webgis_toolbox), &message)
         }
     };
     result

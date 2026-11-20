@@ -1,3 +1,4 @@
+use crate::message;
 use geo::{Area, Contains, Coord, LineString, Polygon};
 use quick_xml::{Reader, events::Event};
 use serde_json::Value;
@@ -29,7 +30,9 @@ pub(super) fn read(
         "geojson" | "json" => Ok((geojson(&read_file(path)?)?, "EPSG:4326".into())),
         "kml" => Ok((kml(&read_file(path)?)?, "EPSG:4326".into())),
         "shp" => {
-            let shp = File::open(path).map_err(|err| err.to_string())?;
+            let shp = File::open(path).map_err(|err| {
+                message!(operation_error, message!(open_input, path.display()), err)
+            })?;
             let projection = read_sidecar(path)?;
             Ok((shapes(shp)?, projection_or_manual(projection, manual_crs)?))
         }
@@ -39,9 +42,13 @@ pub(super) fn read(
             let layer = match (layer.filter(|s| !s.is_empty()), layers.as_slice()) {
                 (None, [only]) => only,
                 (Some(layer), _) if layers.iter().any(|name| name == layer) => layer,
-                (_, []) => return Err("ZIP 中没有 Shapefile".into()),
-                (None, _) => return Err("请选择 ZIP 中的 Shapefile 图层".into()),
-                (Some(_), _) => return Err("ZIP 中找不到所选 Shapefile 图层".into()),
+                (_, []) => return Err(message!(no_shapefile_in_the_zip).into()),
+                (None, _) => return Err(message!(select_a_shapefile_layer_in_the_zip).into()),
+                (Some(_), _) => {
+                    return Err(
+                        message!(the_selected_shapefile_layer_was_not_found_in_the_zip).into(),
+                    );
+                }
             };
             let prj_name = Path::new(layer)
                 .with_extension("prj")
@@ -54,9 +61,9 @@ pub(super) fn read(
                 [] => None,
                 [name] => Some(
                     String::from_utf8(zip_member(&mut archive, name)?)
-                        .map_err(|_| "PRJ 不是 UTF-8 文本")?,
+                        .map_err(|_| message!(prj_is_not_utf_8_text))?,
                 ),
-                _ => return Err("ZIP 中有多个同名 PRJ".into()),
+                _ => return Err(message!(zip_contains_more_than_one_prj_with_the_same_name).into()),
             };
             let bytes = zip_member(&mut archive, layer)?;
             Ok((
@@ -64,7 +71,7 @@ pub(super) fn read(
                 projection_or_manual(projection, manual_crs)?,
             ))
         }
-        _ => Err("范围文件需要为 SHP、ZIP、KML 或 GeoJSON".into()),
+        _ => Err(message!(boundary_file_must_be_shp_zip_kml_or_geojson).into()),
     }
 }
 
@@ -82,7 +89,7 @@ fn projection_or_manual(
     projection
         .filter(|s| !s.trim().is_empty())
         .or_else(|| manual.filter(|s| !s.trim().is_empty()).map(str::to_owned))
-        .ok_or_else(|| "Shapefile 缺少 .prj，请填写范围坐标系".into())
+        .ok_or_else(|| message!(shapefile_lacks_a_prj_file_enter_the_boundary_crs).into())
 }
 
 fn read_sidecar(path: &Path) -> Result<Option<String>, String> {
@@ -99,15 +106,16 @@ fn read_sidecar(path: &Path) -> Result<Option<String>, String> {
         {
             return String::from_utf8(read_file(&entry.path())?)
                 .map(Some)
-                .map_err(|_| "PRJ 不是 UTF-8 文本".into());
+                .map_err(|_| message!(prj_is_not_utf_8_text).into());
         }
     }
     Ok(None)
 }
 
 fn open_zip(path: &Path) -> Result<zip::ZipArchive<File>, String> {
-    let stream = File::open(path).map_err(|err| err.to_string())?;
-    zip::ZipArchive::new(stream).map_err(|err| format!("无法读取 ZIP：{err}"))
+    let stream = File::open(path)
+        .map_err(|err| message!(operation_error, message!(open_input, path.display()), err))?;
+    zip::ZipArchive::new(stream).map_err(|err| message!(could_not_read_zip_err, err = err))
 }
 
 fn matching_zip_names(
@@ -116,7 +124,7 @@ fn matching_zip_names(
 ) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for name in archive.file_names() {
-        let name = name.map_err(|err| format!("无法读取 ZIP 条目名称：{err}"))?;
+        let name = name.map_err(|err| message!(could_not_read_zip_entry_name_err, err = err))?;
         if matches(&name) {
             names.push(name.into_owned());
         }
@@ -127,16 +135,17 @@ fn matching_zip_names(
 fn zip_member(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
     let member = zip
         .by_name(name)
-        .map_err(|err| format!("ZIP 图层 {name}：{err}"))?;
+        .map_err(|err| message!(zip_layer_name_err, name = name, err = err))?;
     if !member.is_file() || member.size() > MAX_MEMBER {
-        return Err(format!("不支持的 ZIP 条目或大小：{name}"));
+        return Err(message!(unsupported_zip_entry_or_size_name, name = name));
     }
     read_limited(member, name)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     read_limited(
-        File::open(path).map_err(|err| err.to_string())?,
+        File::open(path)
+            .map_err(|err| message!(operation_error, message!(open_input, path.display()), err))?,
         &path.display().to_string(),
     )
 }
@@ -146,24 +155,25 @@ fn read_limited(reader: impl Read, label: &str) -> Result<Vec<u8>, String> {
     reader
         .take(MAX_MEMBER + 1)
         .read_to_end(&mut bytes)
-        .map_err(|err| format!("{label}：{err}"))?;
+        .map_err(|err| message!(operation_error, message!(read_input, label), err))?;
     if bytes.len() as u64 > MAX_MEMBER {
-        return Err(format!("{label} 超过 256 MiB"));
+        return Err(message!(label_exceeds_256_mib, label = label));
     }
     Ok(bytes)
 }
 
 fn shapes<R: Read + Seek>(input: R) -> Result<Vec<Polygon>, String> {
-    let mut reader = ShapeReader::new(input).map_err(|err| format!("无效 Shapefile：{err}"))?;
+    let mut reader =
+        ShapeReader::new(input).map_err(|err| message!(invalid_shapefile_err, err = err))?;
     let mut polygons = Vec::new();
     for shape in reader.iter_shapes() {
-        let shape = shape.map_err(|err| format!("读取 Shapefile 失败：{err}"))?;
+        let shape = shape.map_err(|err| message!(could_not_read_shapefile_err, err = err))?;
         match shape {
             Shape::Polygon(p) => polygons.extend(shape_rings(p.rings())?),
             Shape::PolygonM(p) => polygons.extend(shape_rings(p.rings())?),
             Shape::PolygonZ(p) => polygons.extend(shape_rings(p.rings())?),
             Shape::NullShape => {}
-            _ => return Err("Shapefile 需要为面图层".into()),
+            _ => return Err(message!(shapefile_must_be_a_polygon_layer).into()),
         }
     }
     Ok(polygons)
@@ -184,14 +194,17 @@ where
         }
     }
     for hole in holes {
-        let first = hole.0.first().ok_or("Shapefile 含空内环")?;
+        let first = hole
+            .0
+            .first()
+            .ok_or(message!(shapefile_contains_an_empty_inner_ring))?;
         let idx = shells
             .iter()
             .enumerate()
             .filter(|(_, shell)| Polygon::new(shell.exterior().clone(), vec![]).contains(first))
             .min_by(|(_, a), (_, b)| a.unsigned_area().total_cmp(&b.unsigned_area()))
             .map(|(i, _)| i)
-            .ok_or("Shapefile 的内环没有匹配外环")?;
+            .ok_or(message!(shapefile_inner_ring_has_no_matching_outer_ring))?;
         shells[idx].interiors_push(hole);
     }
     Ok(shells)
@@ -199,7 +212,7 @@ where
 
 fn geojson(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
     let value: Value =
-        serde_json::from_slice(bytes).map_err(|err| format!("无效 GeoJSON：{err}"))?;
+        serde_json::from_slice(bytes).map_err(|err| message!(invalid_geojson_err, err = err))?;
     let mut polygons = Vec::new();
     collect_geojson(&value, &mut polygons)?;
     Ok(polygons)
@@ -207,7 +220,10 @@ fn geojson(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
 
 fn collect_geojson(value: &Value, polygons: &mut Vec<Polygon>) -> Result<(), String> {
     if value.get("crs").is_some_and(|crs| !crs.is_null()) {
-        return Err("GeoJSON 必须使用 WGS84 经纬度，且不能包含旧版 CRS 声明".into());
+        return Err(message!(
+            geojson_must_use_wgs84_longitude_and_latitude_without_a_legacy_crs_declaration
+        )
+        .into());
     }
     match value["type"].as_str() {
         Some("Feature") if value["geometry"].is_null() => {}
@@ -229,7 +245,7 @@ fn collect_geojson(value: &Value, polygons: &mut Vec<Polygon>) -> Result<(), Str
             }
         }
         Some("Point" | "MultiPoint" | "LineString" | "MultiLineString") => {}
-        _ => return Err("无效的 GeoJSON 对象类型".into()),
+        _ => return Err(message!(invalid_geojson_object_type).into()),
     }
     Ok(())
 }
@@ -238,7 +254,7 @@ fn list(value: &Value) -> Result<&[Value], String> {
     value
         .as_array()
         .map(Vec::as_slice)
-        .ok_or_else(|| "GeoJSON 中缺少数组".into())
+        .ok_or_else(|| message!(missing_array_in_geojson).into())
 }
 
 fn json_polygon(value: &Value) -> Result<Polygon, String> {
@@ -248,8 +264,12 @@ fn json_polygon(value: &Value) -> Result<Polygon, String> {
             list(ring)?
                 .iter()
                 .map(|point| {
-                    let x = point[0].as_f64().ok_or("无效 GeoJSON 经度")?;
-                    let y = point[1].as_f64().ok_or("无效 GeoJSON 纬度")?;
+                    let x = point[0]
+                        .as_f64()
+                        .ok_or(message!(invalid_geojson_longitude))?;
+                    let y = point[1]
+                        .as_f64()
+                        .ok_or(message!(invalid_geojson_latitude))?;
                     Ok(Coord { x, y })
                 })
                 .collect::<Result<Vec<_>, String>>()
@@ -257,7 +277,9 @@ fn json_polygon(value: &Value) -> Result<Polygon, String> {
         })
         .collect::<Result<Vec<_>, String>>()?
         .into_iter();
-    let outer = rings.next().ok_or("GeoJSON 多边形缺少外环")?;
+    let outer = rings
+        .next()
+        .ok_or(message!(geojson_polygon_is_missing_an_outer_ring))?;
     Ok(Polygon::new(outer, rings.collect()))
 }
 
@@ -271,7 +293,7 @@ fn kml(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
     loop {
         match reader
             .read_event()
-            .map_err(|err| format!("无效 KML：{err}"))?
+            .map_err(|err| message!(invalid_kml_err, err = err))?
         {
             Event::Start(tag) => {
                 let name = tag.local_name().as_ref().to_vec();
@@ -287,7 +309,7 @@ fn kml(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
                 text.push_str(&value.decode().map_err(|err| err.to_string())?);
             }
             Event::End(_) => {
-                let name = stack.pop().ok_or("KML 标签不匹配")?;
+                let name = stack.pop().ok_or(message!(mismatched_kml_tags))?;
                 if name == b"coordinates" && stack.len() >= 3 {
                     let suffix = &stack[stack.len() - 3..];
                     if suffix[0] == b"Polygon" && suffix[2] == b"LinearRing" {
@@ -295,7 +317,9 @@ fn kml(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
                         match suffix[1].as_slice() {
                             b"outerBoundaryIs" => {
                                 if outer.replace(ring).is_some() {
-                                    return Err("KML 多边形有多个外环".into());
+                                    return Err(
+                                        message!(kml_polygon_has_multiple_outer_rings).into()
+                                    );
                                 }
                             }
                             b"innerBoundaryIs" => holes.push(ring),
@@ -305,18 +329,20 @@ fn kml(bytes: &[u8]) -> Result<Vec<Polygon>, String> {
                 }
                 if name == b"Polygon" {
                     polygons.push(Polygon::new(
-                        outer.take().ok_or("KML 多边形缺少外环")?,
+                        outer
+                            .take()
+                            .ok_or(message!(kml_polygon_is_missing_an_outer_ring))?,
                         std::mem::take(&mut holes),
                     ));
                 }
             }
-            Event::DocType(_) => return Err("KML 不支持 DTD".into()),
+            Event::DocType(_) => return Err(message!(dtd_is_unsupported_in_kml).into()),
             Event::Eof => break,
             _ => {}
         }
     }
     if !stack.is_empty() {
-        return Err("KML XML 未闭合".into());
+        return Err(message!(unclosed_element_in_kml_xml).into());
     }
     Ok(polygons)
 }
@@ -328,11 +354,11 @@ fn parse_kml_ring(text: &str) -> Result<LineString, String> {
             let x = parts
                 .next()
                 .and_then(|v| v.parse().ok())
-                .ok_or("无效 KML 经度")?;
+                .ok_or(message!(invalid_kml_longitude))?;
             let y = parts
                 .next()
                 .and_then(|v| v.parse().ok())
-                .ok_or("无效 KML 纬度")?;
+                .ok_or(message!(invalid_kml_latitude))?;
             Ok(Coord { x, y })
         })
         .collect::<Result<Vec<_>, String>>()

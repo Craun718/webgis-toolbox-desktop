@@ -3729,12 +3729,14 @@ name = "webgis-toolbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd",
  "chrono",
  "crs-definitions",
  "dirs",
  "eframe",
  "flate2",
  "image",
+ "pollster",
  "proj4rs",
  "quick-xml",
  "rayon",

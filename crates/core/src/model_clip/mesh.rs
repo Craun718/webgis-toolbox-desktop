@@ -1,3 +1,4 @@
+use crate::message;
 use geo::{Coord, MultiPolygon, Orient, Polygon, TriangulateDelaunay, Validation, unary_union};
 use rstar::{
     AABB, RTree,
@@ -15,7 +16,7 @@ pub struct Boundary {
 impl Boundary {
     pub fn new(polygons: &[Polygon]) -> Result<Self, String> {
         if polygons.is_empty() {
-            return Err("裁剪范围没有多边形".into());
+            return Err(message!(the_clip_boundary_contains_no_polygons).into());
         }
         for polygon in polygons {
             if std::iter::once(polygon.exterior())
@@ -23,11 +24,11 @@ impl Boundary {
                 .flat_map(|ring| &ring.0)
                 .any(|p| !p.x.is_finite() || !p.y.is_finite())
             {
-                return Err("裁剪范围包含非有限坐标".into());
+                return Err(message!(clip_boundary_contains_non_finite_coordinates).into());
             }
             polygon
                 .check_validation()
-                .map_err(|err| format!("无效多边形：{err}"))?;
+                .map_err(|err| message!(invalid_polygon_err, err = err))?;
         }
         let oriented: Vec<_> = polygons
             .iter()
@@ -40,7 +41,7 @@ impl Boundary {
                 .constrained_triangulation(geo::triangulate_delaunay::DelaunayTriangulationConfig {
                     snap_radius: 1e-10,
                 })
-                .map_err(|err| format!("范围三角剖分失败：{err}"))?;
+                .map_err(|err| message!(boundary_triangulation_failed_err, err = err))?;
             for part in parts {
                 let mut corners = part.to_array();
                 if side(corners[0], corners[1], corners[2]) < 0.0 {
@@ -50,7 +51,7 @@ impl Boundary {
             }
         }
         if triangles.is_empty() {
-            return Err("裁剪范围面积为零".into());
+            return Err(message!(the_clip_boundary_has_zero_area).into());
         }
         let index = RTree::bulk_load(
             triangles

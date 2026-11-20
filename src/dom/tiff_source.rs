@@ -13,6 +13,7 @@ use tiff::{
     decoder::{Decoder, TiffCodingUnit},
     tags::{IfdPointer, Tag},
 };
+use webgis_core::message;
 
 const CACHE_BYTES: usize = MAX_CHUNK;
 
@@ -54,7 +55,10 @@ impl WhiteAlpha {
         chunks_per_plane: usize,
     ) -> Result<Self> {
         let predictor = tags.find_tag_unsigned(Tag::Predictor)?.unwrap_or(1);
-        ensure!(matches!(predictor, 1 | 2), "不支持的灰度 Alpha TIFF 预测器");
+        ensure!(
+            matches!(predictor, 1 | 2),
+            message!(unsupported_tiff_predictor_for_grayscale_with_alpha)
+        );
         Ok(Self {
             raw: RawBlocks::new(tags, tiled)?,
             predictor,
@@ -77,7 +81,7 @@ impl WhiteAlpha {
         let stride = width as usize * samples;
         let size = stride
             .checked_mul(height as usize)
-            .context("TIFF 块尺寸溢出")?;
+            .context(message!(tiff_block_size_overflow))?;
         let mut result = Vec::new();
         for plane in 0..planes {
             let mut bytes = self
@@ -111,7 +115,7 @@ impl Source {
         let (crs, transform) = geometry(&mut decoder.image_ifd())?;
         let chunk = decoder.chunk_dimensions().into();
         let [cw, ch]: [u32; 2] = chunk;
-        ensure!(cw > 0 && ch > 0, "TIFF 块尺寸无效");
+        ensure!(cw > 0 && ch > 0, message!(invalid_tiff_block_dimensions));
         let expected_chunks = u64::from(width.div_ceil(cw)) * u64::from(height.div_ceil(ch));
         let tiled = decoder.get_chunk_type() == tiff::decoder::ChunkType::Tile;
         let mut tags = decoder.image_ifd();
@@ -122,14 +126,16 @@ impl Source {
         let colors = match (photo, samples) {
             (0 | 1, 1 | 2) => 1,
             (2, 3 | 4) | (6, 3) => 3,
-            _ => anyhow::bail!("仅支持 8 位灰度、灰度 Alpha、RGB 或 RGBA GeoTIFF"),
+            _ => anyhow::bail!(message!(
+                only_8_bit_grayscale_grayscale_with_alpha_rgb_or_rgba_geotiff_is_supported
+            )),
         };
         let bits = tags.get_tag_u16_vec(Tag::BitsPerSample)?;
         let format = tags.find_tag_unsigned_vec::<u16>(Tag::SampleFormat)?;
         ensure!(
             bits.iter().all(|&bits| bits == 8)
                 && format.is_none_or(|values| values.iter().all(|&value| value == 1)),
-            "仅支持 8 位无符号 GeoTIFF 像元"
+            message!(only_unsigned_8_bit_geotiff_pixels_are_supported)
         );
         let extra = tags
             .find_tag_unsigned_vec::<u16>(Tag::ExtraSamples)?
@@ -137,7 +143,7 @@ impl Source {
         let alpha = match (samples - colors, extra.as_slice()) {
             (0, []) => 0,
             (1, [kind @ (1 | 2)]) => *kind,
-            _ => anyhow::bail!("额外的 TIFF 波段必须标记为 Alpha"),
+            _ => anyhow::bail!(message!(extra_tiff_bands_must_be_marked_as_alpha)),
         };
         let planar = tags
             .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)?
@@ -148,11 +154,14 @@ impl Source {
             .unwrap_or(1);
         ensure!(
             matches!(compression, 1 | 5 | 7 | 8 | 32946),
-            "不支持的 TIFF 压缩 {compression}"
+            message!(
+                unsupported_tiff_compression_compression,
+                compression = compression
+            )
         );
         ensure!(
             photo != 6 || compression == 7,
-            "仅支持 JPEG 压缩的 YCbCr 影像"
+            message!(only_jpeg_compressed_ycbcr_images_are_supported)
         );
         let nodata = tags
             .find_tag(Tag::GdalNodata)?
@@ -160,7 +169,7 @@ impl Source {
             .transpose()?
             .map(|text| text.trim().trim_end_matches('\0').parse::<f64>())
             .transpose()
-            .context("无效的 TIFF NoData 值")?
+            .context(message!(invalid_tiff_nodata_value))?
             .filter(|n| (0.0..=255.0).contains(n) && n.fract() == 0.)
             .map(|n| n as u8);
         let sub_ifds = tags
@@ -208,10 +217,12 @@ impl Source {
         let decoder = &mut self.decoder;
         let data = self.cache.get(chunk_index, || {
             let unit = TiffCodingUnit(chunk_index);
-            let len = plane.checked_mul(self.samples).context("TIFF 块尺寸溢出")?;
+            let len = plane
+                .checked_mul(self.samples)
+                .context(message!(tiff_block_size_overflow))?;
             ensure!(
                 len <= MAX_CHUNK,
-                "单个 TIFF 块超过 64 MiB，请使用较小的条带或分块"
+                message!(a_tiff_block_exceeds_64_mib_use_smaller_strips_or_tiles)
             );
             if let Some(white) = &self.white_alpha {
                 return white.read(
@@ -326,7 +337,10 @@ fn find_mask(
             break;
         };
         if linked {
-            ensure!(seen.insert(pointer.0), "TIFF 的 IFD 链包含重复引用");
+            ensure!(
+                seen.insert(pointer.0),
+                message!(tiff_ifd_chain_contains_a_duplicate_reference)
+            );
         }
         let dir = decoder.read_directory(pointer)?;
         if linked {
@@ -343,7 +357,10 @@ fn find_mask(
                 if mask_pointer == Some(pointer.0) {
                     continue;
                 }
-                ensure!(mask.is_none(), "TIFF 包含多个原始分辨率掩膜");
+                ensure!(
+                    mask.is_none(),
+                    message!(tiff_contains_multiple_full_resolution_masks)
+                );
                 mask = Some(Mask::read_tags(&mut tags)?);
                 mask_pointer = Some(pointer.0);
                 if !single_image {
@@ -352,11 +369,14 @@ fn find_mask(
             } else {
                 ensure!(
                     !single_image || flags & 1 != 0,
-                    "TIFF 原图与内部掩膜尺寸不一致"
+                    message!(tiff_image_dimensions_differ_from_its_internal_mask)
                 );
             }
         } else if flags & 1 == 0 {
-            ensure!(!single_image, "不支持包含多个原始分辨率影像的 TIFF");
+            ensure!(
+                !single_image,
+                message!(tiff_with_multiple_full_resolution_images_is_unsupported)
+            );
             if linked {
                 break;
             }

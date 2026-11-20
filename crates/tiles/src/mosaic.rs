@@ -1,4 +1,5 @@
 use std::{fs::File, path::Path};
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result};
@@ -40,8 +41,12 @@ fn write(file: &mut File, level: &Level, zoom: u8, pool: Option<&ThreadPool>) ->
     let bounds = Bounds::of(level);
     let cols = bounds.max_x - bounds.min_x + 1;
     let rows = bounds.max_y - bounds.min_y + 1;
-    let width = cols.checked_mul(size).context("拼接宽度超出 TIFF 限制")?;
-    let height = rows.checked_mul(size).context("拼接高度超出 TIFF 限制")?;
+    let width = cols
+        .checked_mul(size)
+        .context(message!(mosaic_width_exceeds_the_tiff_limit))?;
+    let height = rows
+        .checked_mul(size)
+        .context(message!(mosaic_height_exceeds_the_tiff_limit))?;
     let span = tile_span(zoom);
     let resolution = span / f64::from(size);
     let left = -HALF_WORLD + f64::from(bounds.min_x) * span;

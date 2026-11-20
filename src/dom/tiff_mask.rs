@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::read::ZlibDecoder;
 use std::io::{Read, Seek, SeekFrom};
 use tiff::{decoder::IfdDecoder, tags::Tag};
+use webgis_core::message;
 
 /// TIFF 的 1 位掩膜独立于颜色 IFD，像元按行用位打包。
 pub(super) struct Mask {
@@ -16,7 +17,7 @@ impl Mask {
     pub fn read_tags(tags: &mut IfdDecoder<'_>) -> Result<Self> {
         ensure!(
             tags.get_tag_u32(Tag::PhotometricInterpretation)? == 4,
-            "无效的 TIFF 掩膜颜色类型"
+            message!(invalid_tiff_mask_color_type)
         );
         ensure!(
             tags.find_tag_unsigned::<u16>(Tag::BitsPerSample)?
@@ -26,7 +27,7 @@ impl Mask {
                     .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)?
                     .unwrap_or(1)
                     == 1,
-            "TIFF 掩膜必须为单波段 1 位影像"
+            message!(tiff_mask_must_be_a_single_band_1_bit_image)
         );
         let size = [
             tags.get_tag_u32(Tag::ImageWidth)?,
@@ -48,13 +49,19 @@ impl Mask {
         };
         ensure!(
             size.into_iter().chain(chunk).all(|v| v > 0),
-            "TIFF 掩膜尺寸无效"
+            message!(invalid_tiff_mask_dimensions)
         );
         let blocks = RawBlocks::new(tags, tiled)?;
         let count = u64::from(size[0].div_ceil(chunk[0])) * u64::from(size[1].div_ceil(chunk[1]));
-        ensure!(blocks.offsets.len() as u64 == count, "TIFF 掩膜块索引无效");
+        ensure!(
+            blocks.offsets.len() as u64 == count,
+            message!(invalid_tiff_mask_block_index)
+        );
         let fill_order = tags.find_tag_unsigned::<u16>(Tag::FillOrder)?.unwrap_or(1);
-        ensure!(matches!(fill_order, 1 | 2), "无效的 TIFF 掩膜位顺序");
+        ensure!(
+            matches!(fill_order, 1 | 2),
+            message!(invalid_tiff_mask_bit_order)
+        );
         Ok(Self {
             size,
             chunk,
@@ -106,11 +113,17 @@ impl RawBlocks {
         };
         let offsets = tags.get_tag_u64_vec(offset_tag)?;
         let lengths = tags.get_tag_u64_vec(length_tag)?;
-        ensure!(offsets.len() == lengths.len(), "TIFF 块索引无效");
+        ensure!(
+            offsets.len() == lengths.len(),
+            message!(invalid_tiff_block_index)
+        );
         let compression = tags.find_tag_unsigned(Tag::Compression)?.unwrap_or(1);
         ensure!(
             matches!(compression, 1 | 5 | 8 | 32946),
-            "不支持的 TIFF 数据块压缩 {compression}"
+            message!(
+                unsupported_tiff_block_compression_compression,
+                compression = compression
+            )
         );
         Ok(Self {
             offsets,
@@ -125,10 +138,13 @@ impl RawBlocks {
         index: usize,
         size: usize,
     ) -> Result<Vec<u8>> {
-        let length = *self.lengths.get(index).context("TIFF 块超出范围")?;
+        let length = *self
+            .lengths
+            .get(index)
+            .context(message!(tiff_block_is_out_of_range))?;
         ensure!(
             size <= MAX_CHUNK && length <= MAX_CHUNK as u64,
-            "单个 TIFF 块超出内存限制"
+            message!(a_tiff_block_exceeds_the_memory_limit)
         );
         let mut data = vec![0; size];
         if self.offsets[index] == 0 && length == 0 {
@@ -157,11 +173,11 @@ impl RawBlocks {
                         dst.is_empty()
                             || matches!(status, weezl::LzwStatus::Ok)
                                 && (result.consumed_in > 0 || result.consumed_out > 0),
-                        "TIFF LZW 块大小无效"
+                        message!(invalid_tiff_lzw_block_size)
                     );
                 }
             }
-            _ => bail!("不支持的 TIFF 压缩"),
+            _ => bail!(message!(unsupported_tiff_compression)),
         }
         Ok(data)
     }

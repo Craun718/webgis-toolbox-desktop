@@ -16,6 +16,7 @@ use tiff::{
     encoder::{DirectoryEncoder, TiffEncoder, TiffKindBig},
     tags::Tag,
 };
+use webgis_core::message;
 
 pub(super) const TILE: usize = 256;
 pub(super) const NODATA: f32 = -9999.;
@@ -82,7 +83,7 @@ impl Blocks {
         let [cols, rows] = spec.tile_grid();
         ensure!(
             self.offsets.len() == cols * rows,
-            "TIFF 写出块数与栅格尺寸不符"
+            message!(written_tiff_block_count_does_not_match_raster_dimensions)
         );
         let (bits, samples, photo) = match kind {
             RasterKind::Dsm => (32_u16, 1_u16, 1_u16),
@@ -305,7 +306,10 @@ impl OverviewSource<'_> {
                         }
                     }
                     DecodingResult::U8(data) => {
-                        let (mask, reader) = self.mask.as_mut().context("DOM 缺少内部掩膜")?;
+                        let (mask, reader) = self
+                            .mask
+                            .as_mut()
+                            .context(message!(dom_is_missing_an_internal_mask))?;
                         let bits = mask.read_chunk(reader, index)?;
                         for (i, rgb) in data.chunks_exact(3).enumerate() {
                             if bit(&bits, MASK_STRIDE, i % width, i / width) {
@@ -317,7 +321,7 @@ impl OverviewSource<'_> {
                             }
                         }
                     }
-                    _ => bail!("重新读取原始 TIFF 块时发现意外的像元类型"),
+                    _ => bail!(message!(unexpected_tiff_block_pixel_type)),
                 }
             }
         }
@@ -341,30 +345,30 @@ pub(super) fn verify(
         let [w, h] = spec.size.map(|n| n as u32);
         ensure!(
             ds.dimensions()? == (w, h) && ds.chunk_dimensions() == (TILE as u32, TILE as u32),
-            "TIFF 尺寸或块大小校验失败"
+            message!(tiff_dimensions_or_block_size_failed_validation)
         );
         ensure!(
             ds.get_tag_u32(Tag::NewSubfileType)? == reduced
                 && ds.get_tag_u32(Tag::Compression)? == 8,
-            "TIFF 概览标记或压缩方式校验失败"
+            message!(tiff_overview_flags_or_compression_failed_validation)
         );
         if let Some(expected) = spec.crs {
             let (actual, transform) = geometry(&mut ds.image_ifd())?;
             ensure!(
                 actual.code == expected.code && transform == spec.transform,
-                "TIFF 坐标系或地理定位校验失败"
+                message!(tiff_crs_or_georeferencing_failed_validation)
             );
         } else {
             ensure!(
                 ds.find_tag(Tag::GeoKeyDirectoryTag)?.is_none(),
-                "本地 TIFF 不应包含 CRS"
+                message!(a_local_tiff_must_not_include_a_crs)
             );
             let scale = ds.get_tag_f64_vec(Tag::ModelPixelScaleTag)?;
             let tie = ds.get_tag_f64_vec(Tag::ModelTiepointTag)?;
             let [x, dx, _, y, _, dy] = spec.transform.0;
             ensure!(
                 scale == [dx, -dy, 0.] && tie == [0., 0., 0., x, y, 0.],
-                "本地 TIFF 地理定位校验失败"
+                message!(local_tiff_georeferencing_failed_validation)
             );
         }
         let color_type = match kind {
@@ -372,13 +376,16 @@ pub(super) fn verify(
             RasterKind::Dom => tiff::ColorType::RGB(8),
             RasterKind::Mask => unreachable!(),
         };
-        ensure!(ds.colortype()? == color_type, "TIFF 颜色布局校验失败");
+        ensure!(
+            ds.colortype()? == color_type,
+            message!(tiff_color_layout_failed_validation)
+        );
         let count = ds.tile_count()?;
         let mut valid = 0_u64;
         if kind == RasterKind::Dsm {
             ensure!(
                 ds.get_tag_ascii_string(Tag::GdalNodata)? == "-9999",
-                "DSM NoData 校验失败"
+                message!(dsm_nodata_validation_failed)
             );
         }
         for index in 0..count {
@@ -388,21 +395,21 @@ pub(super) fn verify(
                     valid += data.iter().filter(|&&value| value != NODATA).count() as u64;
                 }
                 DecodingResult::U8(_) if kind == RasterKind::Dom => {}
-                _ => bail!("TIFF 像元类型校验失败"),
+                _ => bail!(message!(tiff_pixel_type_failed_validation)),
             }
         }
         if kind == RasterKind::Dom {
             ds.next_image()?;
             ensure!(
                 ds.get_tag_u32(Tag::NewSubfileType)? == 4 | reduced,
-                "DOM 掩膜标记校验失败"
+                message!(dom_mask_flags_failed_validation)
             );
             let mask = Mask::read_tags(&mut ds.image_ifd())?;
             ensure!(
                 mask.size == [w, h]
                     && mask.chunk == [TILE as u32; 2]
                     && mask.count() == count as usize,
-                "DOM 掩膜尺寸校验失败"
+                message!(dom_mask_dimensions_failed_validation)
             );
             for index in 0..mask.count() {
                 check_cancelled(cancelled)?;
@@ -415,12 +422,12 @@ pub(super) fn verify(
         }
         ensure!(
             valid > 0 && (factor != 1 || valid == valid_pixels),
-            "TIFF 有效像元数校验失败"
+            message!(tiff_valid_pixel_count_failed_validation)
         );
         if factor != *levels.last().unwrap_or(&1) {
             ds.next_image()?;
         }
     }
-    ensure!(!ds.more_images(), "TIFF 包含额外的 IFD");
+    ensure!(!ds.more_images(), message!(tiff_contains_an_extra_ifd));
     Ok(())
 }

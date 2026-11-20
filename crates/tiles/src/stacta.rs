@@ -3,6 +3,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 
 use anyhow::{Context, Result, ensure};
@@ -46,7 +47,7 @@ pub fn run_with_publish(
 ) -> Result<()> {
     ensure!(
         (scheme == Scheme::Tms) == output.is_some(),
-        "--output 仅用于 TMS 导出，且为必填项"
+        message!(output_is_required_for_tms_export_and_valid_only_for_tms)
     );
     let id = match id {
         Some(id) => id,
@@ -54,10 +55,12 @@ pub fn run_with_publish(
             .canonicalize()?
             .file_name()
             .and_then(|name| name.to_str())
-            .context("无法从切片根目录推导 ID，请指定 --id")?
+            .context(message!(
+                could_not_infer_the_id_from_the_tile_root_folder_specify_id
+            ))?
             .to_owned(),
     };
-    ensure!(!id.trim().is_empty(), "--id 不能为空");
+    ensure!(!id.trim().is_empty(), message!(id_cannot_be_empty));
     let index = Index::scan(input, scheme)?;
     let mut size = None;
     let mut layout = None;
@@ -72,21 +75,22 @@ pub fn run_with_publish(
             if scheme == Scheme::Xyz {
                 ensure!(
                     tile.path == input.join(relative_path(zoom, x, y, tile.extension())),
-                    "相对路径模板需要十进制且无前导零的坐标：{}",
-                    tile.path.display()
+                    message!(
+                        relative_path_templates_require_decimal_coordinates_without_leading_zeros,
+                        tile.path.display()
+                    )
                 );
             }
             let decoded = tile.decode(size)?;
             let bands = decoded.bands.with_context(|| {
-                format!(
-                    "STACTA 需要 8 位显式灰度、RGB 或 Alpha 波段：{}",
+                message!(
+                    stacta_requires_explicit_8_bit_grayscale_rgb_or_alpha_bands,
                     tile.path.display()
                 )
             })?;
             ensure!(
                 bands == decoded.image.color().channel_count(),
-                "STACTA 需要显式的 Alpha 波段：{}",
-                tile.path.display()
+                message!(stacta_requires_an_explicit_alpha_band, tile.path.display())
             );
             let tile_layout = (tile.extension(), bands, tile.format);
             Ok((tile, decoded.image.width(), tile_layout))
@@ -95,8 +99,12 @@ pub fn run_with_publish(
             if let Some(size) = size {
                 ensure!(
                     width == size,
-                    "读取切片 {}：切片边长应为 {size}，实际为 {width}",
-                    tile.path.display()
+                    message!(
+                        read_tile_expected_side_length_size_found_width,
+                        tile.path.display(),
+                        size = size,
+                        width = width
+                    )
                 );
             } else {
                 size = Some(width);
@@ -104,9 +112,11 @@ pub fn run_with_publish(
             if let Some((expected, ref first_path)) = layout {
                 ensure!(
                     expected == tile_layout,
-                    "扩展名或波段布局不一致：{} 与 {}",
-                    tile.path.display(),
-                    first_path
+                    message!(
+                        file_extension_or_band_layout_differs_between_and,
+                        tile.path.display(),
+                        first_path
+                    )
                 );
             } else {
                 layout = Some((tile_layout, tile.path.display()));
@@ -129,7 +139,7 @@ pub fn run_with_publish(
                     let path = root.join(relative_path(zoom, x, y, ext));
                     make_parent(&path)?;
                     fs::copy(&tile.path, &path)
-                        .with_context(|| format!("复制 {}", tile.path.display()))?;
+                        .with_context(|| message!(copy, tile.path.display()))?;
                     Ok::<_, anyhow::Error>(())
                 })?;
             }
@@ -179,14 +189,17 @@ pub fn write_rgba_png(
 
 /// 校验原点偏移和栅格尺寸能否由 32 位 STACTA 阅读器表示。
 pub fn check_raster_size(zoom: u8, bounds: Bounds, tile_size: u32) -> Result<()> {
-    ensure!(zoom <= crate::tiles::MAX_ZOOM, "瓦片级别超出范围：{zoom}");
+    ensure!(
+        zoom <= crate::tiles::MAX_ZOOM,
+        message!(tile_zoom_is_out_of_range_zoom, zoom = zoom)
+    );
     let matrix_width = 1_u32 << zoom;
     ensure!(
         bounds.min_x <= bounds.max_x
             && bounds.max_x < matrix_width
             && bounds.min_y <= bounds.max_y
             && bounds.max_y < matrix_width,
-        "级别 {zoom} 的瓦片范围无效"
+        message!(invalid_tile_extent_at_zoom_zoom, zoom = zoom)
     );
     let fits_i32 = |tiles: u32| u64::from(tiles) * u64::from(tile_size) <= i32::MAX as u64;
     ensure!(
@@ -194,7 +207,7 @@ pub fn check_raster_size(zoom: u8, bounds: Bounds, tile_size: u32) -> Result<()>
             && fits_i32(bounds.min_y)
             && fits_i32(bounds.max_x - bounds.min_x + 1)
             && fits_i32(bounds.max_y - bounds.min_y + 1),
-        "级别 {zoom} 的像元原点偏移或栅格尺寸超出 STACTA 的 32 位兼容范围"
+        message!(stacta_raster_size_out_of_range, zoom = zoom)
     );
     Ok(())
 }
@@ -208,8 +221,8 @@ fn write_index(
     levels: impl IntoIterator<Item = (u8, Bounds)>,
     before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    ensure!(!id.trim().is_empty(), "--id 不能为空");
-    ensure!(size > 0, "瓦片像元尺寸必须大于零");
+    ensure!(!id.trim().is_empty(), message!(id_cannot_be_empty));
+    ensure!(size > 0, message!(tile_pixel_size_must_be_positive));
     let mut matrices = Vec::new();
     let mut limits = Map::new();
     let mut bbox = [180.0_f64, 90.0_f64, -180.0_f64, -90.0_f64];
@@ -247,7 +260,10 @@ fn write_index(
         bbox[3] = bbox[3].max(latitude(bounds.min_y));
     }
 
-    ensure!(!matrices.is_empty(), "没有可写入 STACTA 的瓦片级别");
+    ensure!(
+        !matrices.is_empty(),
+        message!(no_tile_zoom_levels_to_write_to_stacta)
+    );
     let names: &[&str] = match bands {
         1 => &["gray"],
         2 => &["gray", "alpha"],

@@ -1,5 +1,6 @@
 //! 有界批处理，结果按输入顺序交还给任务协调线程。
 
+use crate::i18n::{language, with_language};
 use rayon::prelude::*;
 pub use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -25,7 +26,13 @@ pub fn map<T: Send, R: Send, E: Send>(
 ) -> Result<Vec<R>, E> {
     match pool {
         Some(pool) if batch.len() > 1 => {
-            let results: Vec<_> = pool.install(|| batch.into_par_iter().map(&work).collect());
+            let language = language();
+            let results: Vec<_> = pool.install(|| {
+                batch
+                    .into_par_iter()
+                    .map(|item| with_language(language, || work(item)))
+                    .collect()
+            });
             results.into_iter().collect()
         }
         _ => batch.into_iter().map(work).collect(),
@@ -41,11 +48,12 @@ pub fn map_with<T: Send, S: Send, R: Send, E: Send>(
     let states = &mut states[..batch.len()];
     match pool {
         Some(pool) if batch.len() > 1 => {
+            let language = language();
             let results: Vec<_> = pool.install(|| {
                 batch
                     .into_par_iter()
                     .zip(states.par_iter_mut())
-                    .map(|(item, state)| work(item, state))
+                    .map(|(item, state)| with_language(language, || work(item, state)))
                     .collect()
             });
             results.into_iter().collect()

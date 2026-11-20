@@ -1,4 +1,4 @@
-use super::{Progress, Source, TILE, check_cancelled};
+use super::{Phase, Source, TILE, TaskProgress, check_cancelled};
 use anyhow::Result;
 use flate2::{Compression, write::ZlibEncoder};
 use std::{
@@ -6,6 +6,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 use tiff::tags::Tag;
+use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
 
 pub(super) struct Field {
@@ -84,7 +85,7 @@ pub(super) fn write(
     out: &mut (impl Write + Seek),
     source: &mut Source,
     cancelled: &AtomicBool,
-    progress: impl Fn(Progress),
+    progress: impl Fn(TaskProgress),
     pool: Option<&ThreadPool>,
 ) -> Result<()> {
     let mut levels = Vec::new();
@@ -161,23 +162,26 @@ pub(super) fn write(
             }
         }
     }
-    progress(Progress {
-        stage: "刷新 COG 写入缓冲区".into(),
-        fraction: Some(0.90),
-    });
+    progress(TaskProgress::new(
+        Phase::FlushCog,
+        message!(flush_cog_write_buffer),
+        Some(0.90),
+    ));
     out.flush()?;
     Ok(())
 }
 
-fn update(progress: &impl Fn(Progress), number: usize, completed: u64, total: u64) {
-    progress(Progress {
-        stage: if number == 0 {
-            "写入原始分辨率".into()
-        } else {
-            format!("写入 {} 倍概览", 1_u32 << number)
-        },
-        fraction: Some(0.90 * (completed as f32 / total as f32)),
-    });
+fn update(progress: &impl Fn(TaskProgress), number: usize, completed: u64, total: u64) {
+    let stage = if number == 0 {
+        message!(write_full_resolution).to_owned()
+    } else {
+        message!(write_overview, 1_u32 << number)
+    };
+    progress(TaskProgress::new(
+        Phase::WriteCogLevel(number),
+        stage,
+        Some(0.90 * (completed as f32 / total as f32)),
+    ));
 }
 
 fn sample(

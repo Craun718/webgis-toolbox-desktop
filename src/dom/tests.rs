@@ -196,6 +196,38 @@ fn accepts_root_osgb_and_rejects_other_model_inputs() {
 }
 
 #[test]
+fn preflight_localizes_progress_and_validation_without_changing_model_data() {
+    use webgis_core::i18n::{Language, with_language};
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = request(temp.path());
+    let cancelled = AtomicBool::new(false);
+    with_language(Language::Japanese, || {
+        let mut progress = Vec::new();
+        let summary = preflight_with_progress(&request, &cancelled, |event| {
+            progress.push(event);
+        })
+        .unwrap();
+        assert_eq!(summary.crs.as_deref(), Some("EPSG:3857"));
+        assert_eq!(summary.origin, [100., 200., 20.]);
+        assert!(progress.iter().any(|event| {
+            event.phase == Phase::ReadModel
+                && event.display.stage.contains("読み込み中")
+                && event.display.stage.contains("tile_L9_0.osgb")
+        }));
+    });
+
+    request.input = request.input.with_file_name("missing.osgb");
+    with_language(Language::English, || {
+        let error = preflight(&request, &cancelled, |_| {}).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("Input file does not exist: {}", request.input.display())
+        );
+    });
+}
+
+#[test]
 fn follows_mixed_lod_pages_and_discards_embedded_coarse_geometry() {
     let temp = tempfile::tempdir().unwrap();
     let mut request = request(temp.path());
@@ -325,16 +357,11 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
     let flag = AtomicBool::new(false);
     let mut progress = Vec::new();
     let files = run(&request, &flag, |event| progress.push(event), || Ok(())).unwrap();
-    let fractions: Vec<_> = progress
-        .iter()
-        .filter_map(|event| event.fraction)
-        .collect();
+    let fractions: Vec<_> = progress.iter().filter_map(|event| event.fraction).collect();
     assert_eq!(fractions.first(), Some(&0.20));
-    assert!(
-        progress.iter().any(|event| {
-            event.stage.starts_with("已读取 0 个模型") && event.fraction.is_none()
-        })
-    );
+    assert!(progress.iter().any(|event| {
+        event.stage.starts_with("已读取 0 个模型") && event.fraction.is_none()
+    }));
     assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(fractions.iter().all(|&fraction| fraction < 1.0));
     assert!(progress.iter().any(|event| event.stage == "构建三角形索引"));

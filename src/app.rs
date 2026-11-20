@@ -1,3 +1,10 @@
+pub(crate) use settings::startup_language;
+use webgis_core::{
+    i18n::{self, Language},
+    message,
+};
+use webgis_toolbox::dom::{self, Phase, TaskProgress};
+mod file_dialog;
 mod settings;
 mod task;
 
@@ -16,7 +23,6 @@ use tiles_toolbox::{
     tiles::{Format, Index, Scheme},
 };
 use webgis_core::{model_clip as clip, task_pool::ThreadPool};
-use webgis_toolbox::dom;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -29,11 +35,11 @@ enum Tool {
 impl Tool {
     fn name(self) -> &'static str {
         match self {
-            Self::Cog => "生成 COG 云优化 GeoTIFF",
-            Self::Raster => "OSGB 转 DOM / DSM",
+            Self::Cog => message!(create_cloud_optimized_geotiff),
+            Self::Raster => message!(osgb_to_dom_dsm),
             Self::Tiles(operation) => operation.name(),
-            Self::Clip => "OSGB 模型裁剪",
-            Self::Settings => "设置",
+            Self::Clip => message!(clip_osgb_models),
+            Self::Settings => message!(settings),
         }
     }
 }
@@ -48,7 +54,7 @@ pub struct App {
     task_window: Option<TaskWindow>,
     task_sequence: u64,
     show_close_notice: bool,
-    outcome: Option<Result<Outcome>>,
+    outcome: Option<(Language, Result<Outcome>)>,
     font_loaded: bool,
     settings: Settings,
 }
@@ -70,6 +76,7 @@ enum Outcome {
 impl App {
     pub fn new(ctx: &EguiContext) -> Self {
         ctx.all_styles_mut(|style| style.spacing.button_padding += egui::vec2(4.0, 4.0));
+        let settings = Settings::new(ctx);
         Self {
             selected: Tool::Raster,
             raster: RasterForm {
@@ -84,8 +91,8 @@ impl App {
             task_sequence: 0,
             show_close_notice: false,
             outcome: None,
-            font_loaded: install_font(ctx),
-            settings: Settings::new(ctx),
+            font_loaded: install_font(ctx, settings.language()),
+            settings,
         }
     }
 
@@ -107,7 +114,9 @@ impl App {
                 Ok(result) => result,
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let result = Err(anyhow!("后台处理线程异常退出"));
+                    let result = i18n::with_language(worker.language(), || {
+                        Err(anyhow!(message!(the_background_worker_exited_unexpectedly)))
+                    });
                     worker.finish_disconnected(&result);
                     result
                 }
@@ -118,7 +127,7 @@ impl App {
                 self.clip.layers.clone_from(layers);
                 self.clip.layer = (layers.len() == 1).then(|| layers[0].clone());
             }
-            self.outcome = Some(result);
+            self.outcome = Some((worker.language(), result));
             self.worker = None;
         }
     }
@@ -126,9 +135,9 @@ impl App {
     fn start(&mut self, ctx: &EguiContext, action: Action) -> Result<()> {
         self.outcome = None;
         let operation = match action {
-            Action::Layers => "扫描 ZIP 图层",
-            Action::Preview => "预检",
-            Action::Run => "处理",
+            Action::Layers => message!(scan_zip_layers),
+            Action::Preview => message!(preflight),
+            Action::Run => message!(process),
         };
         let name = format!("{} · {operation}", self.selected.name());
         let threads = self.settings.threads();
@@ -136,9 +145,9 @@ impl App {
             (Tool::Raster, Action::Preview | Action::Run) => {
                 let request = self.raster.request()?;
                 Worker::start(ctx, &name, true, move |task| {
-                    let update = |event: dom::Progress| task.update(event.stage, event.fraction);
+                    let update = |event| task.update(event);
                     if action == Action::Preview {
-                        Ok(Outcome::RasterPreview(dom::preflight(
+                        Ok(Outcome::RasterPreview(dom::preflight_with_progress(
                             &request,
                             &task.cancelled,
                             update,
@@ -146,7 +155,7 @@ impl App {
                     } else {
                         let pool = processing_pool(threads)?;
                         Ok(Outcome::Artifacts {
-                            paths: dom::run_with_pool(
+                            paths: dom::run_with_progress(
                                 &request,
                                 &task.cancelled,
                                 update,
@@ -159,15 +168,15 @@ impl App {
                 })?
             }
             (Tool::Cog, Action::Run) => {
-                let input = required_path("源 GeoTIFF", &self.cog.input)?;
-                let output = required_path("输出 COG", &self.cog.output)?;
+                let input = required_path(message!(source_geotiff), &self.cog.input)?;
+                let output = required_path(message!(output_cog), &self.cog.output)?;
                 Worker::start(ctx, &name, true, move |task| {
                     let pool = processing_pool(threads)?;
-                    let output = dom::cog::run_with_pool(
+                    let output = dom::cog::run_with_progress(
                         &input,
                         &output,
                         &task.cancelled,
-                        |event| task.update(event.stage, event.fraction),
+                        |event| task.update(event),
                         || task.publish_with_progress(Some(0.95)),
                         pool.as_ref(),
                     )?;
@@ -178,9 +187,13 @@ impl App {
                 })?
             }
             (Tool::Clip, Action::Layers) => {
-                let path = required_path("裁剪范围", &self.clip.boundary)?;
+                let path = required_path(message!(clip_boundary), &self.clip.boundary)?;
                 Worker::start(ctx, &name, false, move |task| {
-                    task.update("扫描 ZIP 图层", None);
+                    task.update(TaskProgress::new(
+                        Phase::ScanLayers,
+                        message!(scan_zip_layers),
+                        None,
+                    ));
                     let layers = clip::zip_layers(&path).map_err(|e| anyhow!(e))?;
                     Ok(Outcome::Layers { path, layers })
                 })?
@@ -188,7 +201,11 @@ impl App {
             (Tool::Clip, Action::Preview | Action::Run) => {
                 let request = self.clip.request()?;
                 Worker::start(ctx, &name, true, move |task| {
-                    task.update("预检模型、裁剪范围与输出", None);
+                    task.update(TaskProgress::new(
+                        Phase::CheckClip,
+                        message!(check_model_boundary_and_output),
+                        None,
+                    ));
                     if action == Action::Preview {
                         return clip::preflight_cancelable(&request, &task.cancelled)
                             .map(Outcome::ClipPreview)
@@ -199,23 +216,25 @@ impl App {
                         &request,
                         &task.cancelled,
                         |p| {
-                            task.update(
-                                format!(
-                                    "裁剪 {}（已处理 {} / 已发现 {} 个模型）",
+                            task.update(TaskProgress::new(
+                                Phase::ClipModel,
+                                message!(
+                                    clipping_processed_models_found,
                                     p.file.display(),
                                     p.completed,
-                                    p.discovered,
+                                    p.discovered
                                 ),
                                 None,
-                            );
+                            ));
                         },
                         || task.publish().map_err(|err| err.to_string()),
                         pool.as_ref(),
                     )
                     .map_err(|e| anyhow!(e))?;
-                    let details = format!(
-                        "已写出 {} 个 OSGB 文件，共 {} 个三角形。",
-                        result.files, result.triangles
+                    let details = message!(
+                        wrote_osgb_files_with_triangles,
+                        result.files,
+                        result.triangles
                     );
                     Ok(Outcome::Artifacts {
                         paths: std::iter::once(result.output)
@@ -243,6 +262,25 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &EguiContext, _: &mut eframe::Frame) {
+        let language = self.settings.language();
+        i18n::with_language(language, || self.show(ctx));
+        let saved = self.settings.language();
+        if saved != language {
+            if (saved == Language::Japanese) != (language == Language::Japanese) {
+                self.font_loaded = install_font(ctx, saved);
+            }
+            i18n::with_language(saved, || {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                    message!(webgis_toolbox).into(),
+                ));
+            });
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl App {
+    fn show(&mut self, ctx: &EguiContext) {
         self.poll();
         let busy = self.worker.is_some();
         if busy {
@@ -257,19 +295,21 @@ impl eframe::App for App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_space(12.);
-                ui.heading("WebGIS 工具箱");
+                ui.heading(message!(webgis_toolbox));
                 ui.add_space(16.);
                 ui.add_enabled_ui(!busy, |ui| {
-                    ui.label(RichText::new("三维模型").strong());
+                    ui.label(RichText::new(message!(3d_models)).strong());
                     ui.indent("model_tools", |ui| {
                         self.tool_link(ui, Tool::Raster);
                         self.tool_link(ui, Tool::Clip);
                     });
                     ui.add_space(8.);
-                    ui.label(RichText::new("栅格处理").strong());
-                    ui.indent("raster_tools", |ui| self.tool_link(ui, Tool::Cog));
+                    ui.label(RichText::new(message!(raster_tools)).strong());
+                    ui.indent("raster_tools", |ui| {
+                        self.tool_link(ui, Tool::Cog);
+                    });
                     ui.add_space(8.);
-                    ui.label(RichText::new("瓦片处理").strong());
+                    ui.label(RichText::new(message!(tile_tools)).strong());
                     ui.indent("tile_tools", |ui| {
                         for operation in TileOp::ALL {
                             self.tool_link(ui, Tool::Tiles(operation));
@@ -286,7 +326,11 @@ impl eframe::App for App {
                 ui.add_space(12.);
                 ui.heading(self.selected.name());
                 if !self.font_loaded {
-                    ui.label("Install a Chinese font or set WEBGIS_CJK_FONT to a font path.");
+                    ui.label(if i18n::language() == Language::Japanese {
+                        message!(missing_japanese_font)
+                    } else {
+                        message!(missing_chinese_font)
+                    });
                 }
                 ui.add_space(14.);
                 if self.selected == Tool::Settings {
@@ -294,19 +338,19 @@ impl eframe::App for App {
                     ui.add_space(18.);
                     ui.separator();
                     ui.add_space(10.);
-                    ui.heading("关于");
+                    ui.heading(message!(about));
                     ui.add_space(8.);
                     egui::Grid::new("about_project").show(ui, |ui| {
-                        ui.label("作者");
+                        ui.label(message!(author));
                         ui.label(env!("CARGO_PKG_AUTHORS"));
                         ui.end_row();
 
-                        ui.label("许可证类型");
+                        ui.label(message!(license));
                         ui.label(env!("CARGO_PKG_LICENSE"));
                         ui.end_row();
 
                         let repository = env!("CARGO_PKG_REPOSITORY");
-                        ui.label("项目地址");
+                        ui.label(message!(repository));
                         ui.hyperlink_to(repository, repository);
                         ui.end_row();
                     });
@@ -327,11 +371,11 @@ impl eframe::App for App {
                     ui.add_space(10.);
                     ui.horizontal(|ui| {
                         if matches!(self.selected, Tool::Raster | Tool::Clip)
-                            && ui.button("预检").clicked()
+                            && ui.button(message!(preflight)).clicked()
                         {
                             action = Some(Action::Preview);
                         }
-                        if ui.button(RichText::new("开始处理").strong()).clicked() {
+                        if ui.button(RichText::new(message!(run)).strong()).clicked() {
                             action = Some(Action::Run);
                         }
                     });
@@ -339,17 +383,17 @@ impl eframe::App for App {
                 if let Some(worker) = &self.worker {
                     worker.show_cancel_button(ui);
                 }
-                if let Some(outcome) = &self.outcome {
+                if let Some((language, outcome)) = &self.outcome {
                     ui.add_space(12.);
                     ui.separator();
-                    show_outcome(ui, outcome);
+                    i18n::with_language(*language, || show_outcome(ui, outcome));
                 }
             });
         });
         if let Some(action) = action
             && let Err(err) = self.start(ctx, action)
         {
-            self.outcome = Some(Err(err));
+            self.outcome = Some((i18n::language(), Err(err)));
         }
         if let Some(window) = &self.task_window
             && window.show(ctx, self.worker.is_some())
@@ -361,9 +405,9 @@ impl eframe::App for App {
             if self.show_close_notice {
                 let response =
                     egui::Modal::new(egui::Id::new("task_close_notice")).show(ctx, |ui| {
-                        ui.heading("任务正在进行");
+                        ui.heading(message!(task_in_progress));
                         ui.label(worker.close_notice());
-                        ui.button("确定").clicked()
+                        ui.button(message!(ok)).clicked()
                     });
                 if response.inner {
                     self.show_close_notice = false;
@@ -383,37 +427,73 @@ fn processing_pool(threads: usize) -> Result<Option<ThreadPool>> {
         .num_threads(threads)
         .build()
         .map(Some)
-        .context("无法创建任务线程池")
+        .context(message!(could_not_create_the_task_thread_pool))
 }
 
-fn install_font(ctx: &EguiContext) -> bool {
-    let candidates = [
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
+fn install_font(ctx: &EguiContext, language: Language) -> bool {
+    let japanese = language == Language::Japanese;
+    let family = if japanese {
+        "Noto Sans CJK JP"
+    } else {
+        "Noto Sans CJK SC"
+    };
+    let system_match = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}\n%{file}\n%{index}", family])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let output = String::from_utf8(output.stdout).ok()?;
+            let mut lines = output.lines();
+            let matches = lines.next()?.split(',').any(|name| name == family);
+            let path = PathBuf::from(lines.next()?);
+            let index = lines.next()?.parse().ok()?;
+            matches.then_some((path, index))
+        });
+    let noto_index = if japanese { 0 } else { 2 };
+    let noto = [
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    .map(|path| (PathBuf::from(path), noto_index));
+    let chinese = [
+        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
         "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    ];
-    let configured = std::env::var_os("WEBGIS_CJK_FONT").map(PathBuf::from);
-    for path in configured.into_iter().chain(candidates.map(PathBuf::from)) {
-        if let Ok(bytes) = std::fs::read(&path) {
-            let mut fonts = egui::FontDefinitions::default();
-            let mut font = egui::FontData::from_owned(bytes);
-            // The Noto CJK collection orders JP, KR, SC, TC, HK.
-            if path
+    ]
+    .map(|path| (PathBuf::from(path), 0));
+    let configured = std::env::var_os("WEBGIS_CJK_FONT")
+        .map(PathBuf::from)
+        .map(|path| {
+            let index = if path
                 .file_name()
-                .is_some_and(|p| p == "NotoSansCJK-Regular.ttc")
+                .is_some_and(|name| name == "NotoSansCJK-Regular.ttc")
             {
-                font.index = 2;
-            }
-            fonts.font_data.insert("Chinese".into(), Arc::new(font));
+                noto_index
+            } else {
+                0
+            };
+            (path, index)
+        });
+    let mut fonts = egui::FontDefinitions::default();
+    for (path, index) in configured
+        .into_iter()
+        .chain(system_match)
+        .chain(noto)
+        .chain(chinese.into_iter().filter(|_| !japanese))
+    {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let mut font = egui::FontData::from_owned(bytes);
+            font.index = index;
+            fonts.font_data.insert("CJK".into(), Arc::new(font));
             for family in fonts.families.values_mut() {
-                family.push("Chinese".into());
+                family.push("CJK".into());
             }
             ctx.set_fonts(fonts);
             return true;
         }
     }
+    ctx.set_fonts(fonts);
     false
 }
 
@@ -429,7 +509,7 @@ fn paths(ui: &mut Ui, paths: &[PathBuf]) {
         ui.horizontal_wrapped(|ui| {
             let value = path.display().to_string();
             ui.label(&value);
-            if ui.button("复制路径").clicked() {
+            if ui.button(message!(copy_path)).clicked() {
                 ui.ctx().copy_text(value);
             }
         });
@@ -439,64 +519,73 @@ fn paths(ui: &mut Ui, paths: &[PathBuf]) {
 fn show_outcome(ui: &mut Ui, outcome: &Result<Outcome>) {
     match outcome {
         Ok(Outcome::Cancelled) => {
-            ui.label("任务已取消");
+            ui.label(message!(task_canceled));
         }
         Err(error) => {
             ui.label(
-                RichText::new("处理失败")
+                RichText::new(message!(processing_failed))
                     .color(Color32::from_rgb(220, 82, 75))
                     .strong(),
             );
             ui.add(egui::Label::new(format!("{error:#}")).selectable(true));
         }
         Ok(Outcome::RasterPreview(summary)) => {
-            ui.strong("DOM / DSM 预检");
-            ui.label(format!(
-                "坐标模式　{}　　坐标系　{}",
+            ui.strong(message!(dom_dsm_preflight));
+            ui.label(message!(
+                coordinate_mode_crs,
                 mode_label(summary.mode),
-                summary.crs.as_deref().unwrap_or("本地")
+                summary.crs.as_deref().unwrap_or(message!(local))
             ));
             if let Some(path) = &summary.metadata {
-                ui.label(format!("元数据　{}", path.display()));
+                ui.label(message!(metadata_value, path.display()));
             }
             let [x, y, z, east, north, high] = summary.bounds;
-            ui.label(format!(
-                "范围　X {x} 至 {east}　Y {y} 至 {north}　Z {z} 至 {high}"
+            ui.label(message!(
+                coordinate_extent,
+                x = x,
+                east = east,
+                y = y,
+                north = north,
+                z = z,
+                high = high
             ));
-            ui.label(format!("原点　{:?}", summary.origin));
+            ui.label(message!(origin, summary.origin));
             let [w, h] = summary.size;
-            ui.label(format!(
-                "栅格　{w} × {h}　　像元尺寸　{}",
-                summary.resolution
+            ui.label(message!(
+                raster_dimensions_and_pixel_size,
+                summary.resolution,
+                w = w,
+                h = h
             ));
-            ui.label(format!(
-                "选定模型文件及 LOD（{} 个）　{} 个三角形",
+            ui.label(message!(
+                selected_model_files_and_lods_triangles,
                 summary.selected.len(),
                 summary.triangles
             ));
             paths(ui, &summary.selected);
         }
         Ok(Outcome::ClipPreview(summary)) => {
-            ui.strong("裁剪预检");
-            ui.label(format!(
-                "模型坐标系　{}　　原点　{:?}",
-                summary.reference.srs, summary.reference.origin
+            ui.strong(message!(clip_preflight));
+            ui.label(message!(
+                model_crs_origin,
+                summary.reference.srs,
+                summary.reference.origin
             ));
-            ui.label(format!("输出目录　{}", summary.output.display()));
+            ui.label(message!(output_folder_value, summary.output.display()));
             if summary.output_non_empty {
-                ui.label("输出目录非空。运行前需要确认，同名产物仍受保护。");
+                ui.label(message!(clip_nonempty_output_notice));
             }
-            ui.label("模型入口");
+            ui.label(message!(model_entry));
             paths(ui, &summary.entries);
         }
         Ok(Outcome::Layers { layers, .. }) => {
-            ui.label(format!("找到 {} 个 SHP 图层。", layers.len()));
+            ui.label(message!(found_shp_layers, layers.len()));
         }
         Ok(Outcome::Artifacts {
             paths: files,
             details,
         }) => {
-            ui.strong("处理完成");
+            ui.strong(message!(processing_complete));
             if let Some(details) = details {
                 ui.label(details);
             }
@@ -513,12 +602,16 @@ fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) -> bool {
 }
 
 fn text_edit(ui: &mut Ui, value: &mut String, hint: &str) -> bool {
-    ui.add(
+    let response = ui.add(
         egui::TextEdit::singleline(value)
             .hint_text(hint)
             .desired_width(f32::INFINITY),
-    )
-    .changed()
+    );
+    let changed = response.changed();
+    if !hint.is_empty() && value.is_empty() {
+        response.on_hover_text(hint);
+    }
+    changed
 }
 
 #[derive(Clone, Copy)]
@@ -541,7 +634,7 @@ impl CogForm {
         const EXTENSIONS: &[&str] = &["tif", "tiff"];
         let changed = path_field(
             ui,
-            "源 GeoTIFF",
+            message!(source_geotiff),
             &mut self.input,
             "",
             PathPicker::File("GeoTIFF", EXTENSIONS),
@@ -560,7 +653,7 @@ impl CogForm {
             .unwrap_or("output_cog.tif");
         path_field(
             ui,
-            "输出 COG",
+            message!(output_cog),
             &mut self.output,
             "",
             PathPicker::SaveFile("GeoTIFF", EXTENSIONS, default_name),
@@ -583,47 +676,41 @@ fn path_field(
         |ui| {
             let mut picked = None;
             let current = Path::new(value.trim());
-            let dialog = || {
-                let mut dialog = rfd::FileDialog::new().set_title(label);
-                if let Some(directory) = current.ancestors().find(|path| path.is_dir()) {
-                    dialog = dialog.set_directory(directory);
-                }
-                dialog
-            };
+            let directory = current.ancestors().find(|path| path.is_dir());
+            let dialog =
+                |filter, selection| file_dialog::select(label, directory, filter, selection);
             if matches!(picker, PathPicker::Folder | PathPicker::FileOrFolder(..))
-                && ui.button("选择目录…").clicked()
+                && ui.button(message!(browse_folders)).clicked()
             {
-                picked = dialog().pick_folder();
+                picked = dialog(None, file_dialog::Selection::Folder);
             }
             match picker {
                 PathPicker::File(name, extensions) | PathPicker::FileOrFolder(name, extensions) => {
-                    if ui.button("选择文件…").clicked() {
-                        picked = dialog().add_filter(name, extensions).pick_file();
+                    if ui.button(message!(browse_files)).clicked() {
+                        picked = dialog(Some((name, extensions)), file_dialog::Selection::File);
                     }
                 }
                 PathPicker::SaveFile(name, extensions, default_name) => {
-                    if ui.button("选择保存位置…").clicked() {
+                    if ui.button(message!(save_as)).clicked() {
                         let file_name = current
                             .file_name()
                             .and_then(|name| name.to_str())
                             .filter(|_| !current.is_dir())
                             .unwrap_or(default_name);
-                        picked = dialog()
-                            .add_filter(name, extensions)
-                            .set_file_name(file_name)
-                            .save_file();
+                        picked = dialog(
+                            Some((name, extensions)),
+                            file_dialog::Selection::Save(Some(file_name)),
+                        );
                     }
                 }
                 PathPicker::NewFolder => {
-                    if ui.button("指定新目录…").clicked() {
-                        let mut dialog = dialog();
-                        if let Some(name) = current.file_name().and_then(|name| name.to_str())
-                            && !current.is_dir()
-                        {
-                            dialog = dialog.set_file_name(name);
-                        }
+                    if ui.button(message!(new_folder)).clicked() {
+                        let name = current
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .filter(|_| !current.is_dir());
                         // 导出任务会创建目录，因此这里只选定目标路径。
-                        picked = dialog.save_file();
+                        picked = dialog(None, file_dialog::Selection::Save(name));
                     }
                 }
                 PathPicker::Folder => {}
@@ -669,7 +756,7 @@ mod tests {
 }
 
 fn required_path(label: &str, value: &str) -> Result<PathBuf> {
-    optional_path(value).with_context(|| format!("请填写{label}"))
+    optional_path(value).with_context(|| message!(enter_a_value_for_label, label = label))
 }
 
 fn optional_text(value: &str) -> Option<String> {
@@ -682,9 +769,9 @@ fn optional_path(value: &str) -> Option<PathBuf> {
 
 fn mode_label(mode: dom::Mode) -> &'static str {
     match mode {
-        dom::Mode::Relative => "相对原点",
-        dom::Mode::Absolute => "绝对坐标",
-        dom::Mode::Local => "本地坐标（无 CRS）",
+        dom::Mode::Relative => message!(relative_to_origin),
+        dom::Mode::Absolute => message!(absolute_coordinates),
+        dom::Mode::Local => message!(local_coordinates_no_crs),
     }
 }
 
@@ -704,16 +791,16 @@ impl RasterForm {
     fn ui(&mut self, ui: &mut Ui) {
         path_field(
             ui,
-            "模型输入",
+            message!(input_model),
             &mut self.input,
-            "根 OSGB 文件或 metadata.xml",
+            message!(root_osgb_file_or_metadata_xml),
             PathPicker::File("OSGB / metadata.xml", &["osgb", "xml"]),
         );
         if path_field(
             ui,
-            "输出目录",
+            message!(output_folder),
             &mut self.output,
-            "/路径/栅格成果",
+            message!(path_raster_output),
             PathPicker::Folder,
         ) {
             self.overwrite = false;
@@ -721,14 +808,14 @@ impl RasterForm {
         if !dom::is_metadata_file(Path::new(self.input.trim())) {
             path_field(
                 ui,
-                "元数据",
+                message!(metadata),
                 &mut self.metadata,
-                "留空自动发现 metadata.xml",
+                message!(leave_blank_to_find_metadata_xml_automatically),
                 PathPicker::File("XML", &["xml"]),
             );
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("坐标模式");
+            ui.label(message!(coordinate_mode));
             for mode in [dom::Mode::Relative, dom::Mode::Absolute, dom::Mode::Local] {
                 ui.radio_value(&mut self.mode, mode, mode_label(mode));
             }
@@ -736,27 +823,35 @@ impl RasterForm {
         if self.mode != dom::Mode::Local {
             field(
                 ui,
-                "坐标系",
+                message!(crs),
                 &mut self.crs,
-                "留空使用元数据，或输入 EPSG / WKT",
+                message!(use_metadata_or_enter_epsg_wkt),
             );
         }
         if self.mode != dom::Mode::Absolute {
             field(
                 ui,
-                "XYZ 原点",
+                message!(xyz_origin),
                 &mut self.origin,
-                "留空使用元数据，或输入 X, Y, Z",
+                message!(use_metadata_or_enter_x_y_z),
             );
         }
-        field(ui, "像元尺寸（坐标单位）", &mut self.resolution, "0.05");
-        ui.checkbox(&mut self.overwrite, "确认覆盖输出目录中的同名栅格产物");
+        field(
+            ui,
+            message!(pixel_size_crs_units),
+            &mut self.resolution,
+            "0.05",
+        );
+        ui.checkbox(
+            &mut self.overwrite,
+            message!(overwrite_existing_rasters_with_the_same_names),
+        );
     }
 
     fn request(&self) -> Result<dom::Request> {
         Ok(dom::Request {
-            input: required_path("模型输入", &self.input)?,
-            output: required_path("输出目录", &self.output)?,
+            input: required_path(message!(input_model), &self.input)?,
+            output: required_path(message!(output_folder), &self.output)?,
             metadata: optional_path(&self.metadata),
             crs: (self.mode != dom::Mode::Local)
                 .then(|| optional_text(&self.crs))
@@ -769,7 +864,11 @@ impl RasterForm {
                     .transpose()?
             },
             mode: self.mode,
-            resolution: self.resolution.trim().parse().context("无效的像元尺寸")?,
+            resolution: self
+                .resolution
+                .trim()
+                .parse()
+                .context(message!(invalid_pixel_size))?,
             overwrite: self.overwrite,
         })
     }
@@ -795,37 +894,46 @@ impl ClipForm {
     fn ui(&mut self, ui: &mut Ui) -> bool {
         path_field(
             ui,
-            "模型输入",
+            message!(input_model),
             &mut self.model,
-            "OSGB 文件或包含 metadata.xml 的目录",
+            message!(osgb_file_or_folder_containing_metadata_xml),
             PathPicker::FileOrFolder("OSGB", &["osgb"]),
         );
-        ui.checkbox(&mut self.manual_entry, "手选目录的 OSGB 入口");
+        ui.checkbox(
+            &mut self.manual_entry,
+            message!(choose_the_folder_s_osgb_entry_manually),
+        );
         if self.manual_entry {
             path_field(
                 ui,
-                "入口文件",
+                message!(entry_file),
                 &mut self.entry,
-                "目录内相对路径或绝对路径",
+                message!(relative_path_within_the_folder_or_absolute_path),
                 PathPicker::File("OSGB", &["osgb"]),
             );
         }
-        ui.checkbox(&mut self.manual_reference, "设置单文件的模型坐标系与原点");
+        ui.checkbox(
+            &mut self.manual_reference,
+            message!(set_the_crs_and_origin_for_a_single_model_file),
+        );
         if self.manual_reference {
             field(
                 ui,
-                "模型坐标系",
+                message!(model_crs),
                 &mut self.crs,
-                "EPSG / WKT / ENU:经度,纬度",
+                message!(epsg_wkt_enu_longitude_latitude),
             );
-            field(ui, "模型 XYZ 原点", &mut self.origin, "X, Y, Z");
+            field(ui, message!(model_xyz_origin), &mut self.origin, "X, Y, Z");
         }
         if path_field(
             ui,
-            "裁剪范围",
+            message!(clip_boundary),
             &mut self.boundary,
-            "SHP、ZIP、KML 或 GeoJSON",
-            PathPicker::File("裁剪范围", &["shp", "zip", "kml", "geojson", "json"]),
+            message!(shp_zip_kml_or_geojson),
+            PathPicker::File(
+                message!(clip_boundary),
+                &["shp", "zip", "kml", "geojson", "json"],
+            ),
         ) {
             self.layers.clear();
             self.layer = None;
@@ -835,10 +943,10 @@ impl ClipForm {
             .extension()
             .is_some_and(|s| s.eq_ignore_ascii_case("zip"))
         {
-            load = ui.button("读取 ZIP 图层").clicked();
+            load = ui.button(message!(load_zip_layers)).clicked();
             if !self.layers.is_empty() {
                 egui::ComboBox::from_id_salt("clip-layer")
-                    .selected_text(self.layer.as_deref().unwrap_or("请选择图层"))
+                    .selected_text(self.layer.as_deref().unwrap_or(message!(select_a_layer)))
                     .show_ui(ui, |ui| {
                         for layer in &self.layers {
                             ui.selectable_value(&mut self.layer, Some(layer.clone()), layer);
@@ -848,46 +956,46 @@ impl ClipForm {
         }
         field(
             ui,
-            "裁剪范围坐标系",
+            message!(boundary_crs),
             &mut self.boundary_crs,
-            "留空使用数据自带坐标系",
+            message!(leave_blank_to_use_the_embedded_crs),
         );
         if path_field(
             ui,
-            "输出目录",
+            message!(output_folder),
             &mut self.output,
-            "绝对路径，父目录须存在",
+            message!(absolute_path_with_an_existing_parent_folder),
             PathPicker::Folder,
         ) {
             self.allow_nonempty = false;
         }
         ui.checkbox(
             &mut self.allow_nonempty,
-            "确认向非空目录发布裁剪结果（保护同名文件）",
+            message!(write_results_to_a_nonempty_folder_and_protect_same_name_files),
         );
         load
     }
 
     fn request(&self) -> Result<clip::Request> {
         Ok(clip::Request {
-            model: required_path("模型输入", &self.model)?,
+            model: required_path(message!(input_model), &self.model)?,
             entry: if self.manual_entry {
-                Some(required_path("入口文件", &self.entry)?)
+                Some(required_path(message!(entry_file), &self.entry)?)
             } else {
                 None
             },
             reference: if self.manual_reference {
                 Some(clip::Reference {
-                    srs: optional_text(&self.crs).context("请填写模型坐标系")?,
+                    srs: optional_text(&self.crs).context(message!(enter_the_model_crs))?,
                     origin: dom::parse_origin(&self.origin)?,
                 })
             } else {
                 None
             },
-            boundary: required_path("裁剪范围", &self.boundary)?,
+            boundary: required_path(message!(clip_boundary), &self.boundary)?,
             layer: self.layer.clone(),
             boundary_crs: optional_text(&self.boundary_crs),
-            output: required_path("输出目录", &self.output)?,
+            output: required_path(message!(output_folder), &self.output)?,
             allow_non_empty_output: self.allow_nonempty,
         })
     }
@@ -906,10 +1014,10 @@ impl TileOp {
 
     fn name(self) -> &'static str {
         match self {
-            Self::Mosaic => "拼接 GeoTIFF",
-            Self::Pyramid => "生成多级瓦片",
-            Self::Stacta => "生成 STACTA",
-            Self::MapTiles => "地图切片",
+            Self::Mosaic => message!(mosaic_to_geotiff),
+            Self::Pyramid => message!(generate_tile_pyramid),
+            Self::Stacta => message!(generate_stacta),
+            Self::MapTiles => message!(map_tiles),
         }
     }
 }
@@ -956,26 +1064,26 @@ impl TileForm {
                 ui,
                 "GeoTIFF",
                 &mut self.input,
-                "带坐标系和地理定位的 .tif / .tiff",
+                message!(georeferenced_tif_tiff_with_crs),
                 PathPicker::File("GeoTIFF", &["tif", "tiff"]),
             );
         } else {
             path_field(
                 ui,
-                "瓦片根目录",
+                message!(tile_root_folder),
                 &mut self.input,
-                "包含 z/x/y 图像的目录",
+                message!(folder_containing_z_x_y_images),
                 PathPicker::Folder,
             );
             ui.horizontal(|ui| {
-                ui.label("瓦片行号");
+                ui.label(message!(tile_row_scheme));
                 ui.radio_value(&mut self.scheme, Scheme::Xyz, "XYZ");
                 ui.radio_value(&mut self.scheme, Scheme::Tms, "TMS");
             });
         }
         if matches!(operation, TileOp::Mosaic | TileOp::Pyramid) {
             ui.horizontal(|ui| {
-                ui.label("源级别");
+                ui.label(message!(source_zoom));
                 ui.add(egui::DragValue::new(&mut self.zoom).range(0..=30));
             });
         }
@@ -983,27 +1091,32 @@ impl TileForm {
             TileOp::Mosaic => {
                 path_field(
                     ui,
-                    "GeoTIFF 输出文件",
+                    message!(output_geotiff),
                     &mut self.output,
-                    "/路径/mosaic.tif",
+                    message!(path_mosaic_tif),
                     PathPicker::SaveFile("GeoTIFF", &["tif", "tiff"], "mosaic.tif"),
                 );
             }
             TileOp::Pyramid => {
-                field(ui, "目标级别", &mut self.targets, "例如 0-2,4");
+                field(
+                    ui,
+                    message!(target_zoom_levels),
+                    &mut self.targets,
+                    message!(e_g_0_2_4),
+                );
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("重采样");
+                    ui.label(message!(resampling));
                     for (value, label) in [
-                        (None, "自动"),
-                        (Some(Resampling::Nearest), "最近邻"),
-                        (Some(Resampling::Bilinear), "双线性"),
-                        (Some(Resampling::Average), "平均"),
+                        (None, message!(auto)),
+                        (Some(Resampling::Nearest), message!(nearest_neighbor)),
+                        (Some(Resampling::Bilinear), message!(bilinear)),
+                        (Some(Resampling::Average), message!(average)),
                     ] {
                         ui.radio_value(&mut self.resampling, value, label);
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("格式");
+                    ui.label(message!(format));
                     for (format, name) in [
                         (Format::Png, "PNG"),
                         (Format::Jpeg, "JPEG"),
@@ -1013,45 +1126,55 @@ impl TileForm {
                     }
                 });
                 if self.format == Format::Jpeg {
-                    field(ui, "JPEG 背景", &mut self.background, "#RRGGBB");
+                    field(
+                        ui,
+                        message!(jpeg_background),
+                        &mut self.background,
+                        "#RRGGBB",
+                    );
                 }
                 path_field(
                     ui,
-                    "瓦片输出目录",
+                    message!(tile_output_folder),
                     &mut self.output,
-                    "新目录",
+                    message!(new_folder_2),
                     PathPicker::NewFolder,
                 );
             }
             TileOp::Stacta => {
                 field(
                     ui,
-                    "时间（RFC 3339）",
+                    message!(time_rfc_3339),
                     &mut self.datetime,
-                    "例如 2026-01-01T00:00:00Z",
+                    message!(e_g_2026_01_01t00_00_00z),
                 );
-                field(ui, "STAC ID", &mut self.id, "留空使用瓦片根目录名称");
+                field(
+                    ui,
+                    "STAC ID",
+                    &mut self.id,
+                    message!(defaults_to_the_tile_root_folder_name),
+                );
                 if self.scheme == Scheme::Tms {
                     path_field(
                         ui,
-                        "XYZ 输出目录",
+                        message!(xyz_output_folder),
                         &mut self.output,
-                        "新目录",
+                        message!(new_folder_2),
                         PathPicker::NewFolder,
                     );
                 } else {
-                    ui.label("在源目录生成 stacta.json。");
+                    ui.label(message!(creates_stacta_json_in_the_input_folder));
                 }
             }
             TileOp::MapTiles => {
                 ui.horizontal(|ui| {
-                    ui.label("级别");
-                    ui.label("最小");
+                    ui.label(message!(zoom_levels));
+                    ui.label(message!(min));
                     ui.add(
                         egui::DragValue::new(&mut self.min_zoom)
                             .range(0..=dom::map_tiles::MAX_ZOOM),
                     );
-                    ui.label("最大");
+                    ui.label(message!(max));
                     ui.add(
                         egui::DragValue::new(&mut self.max_zoom)
                             .range(0..=dom::map_tiles::MAX_ZOOM),
@@ -1059,16 +1182,21 @@ impl TileForm {
                 });
                 field(
                     ui,
-                    "时间（RFC 3339）",
+                    message!(time_rfc_3339),
                     &mut self.datetime,
-                    "例如 2026-01-01T00:00:00Z",
+                    message!(e_g_2026_01_01t00_00_00z),
                 );
-                field(ui, "STAC ID", &mut self.id, "留空使用输出目录名");
+                field(
+                    ui,
+                    "STAC ID",
+                    &mut self.id,
+                    message!(defaults_to_the_output_folder_name),
+                );
                 path_field(
                     ui,
-                    "输出目录",
+                    message!(output_folder),
                     &mut self.output,
-                    "新目录",
+                    message!(new_folder_2),
                     PathPicker::NewFolder,
                 );
             }
@@ -1085,23 +1213,24 @@ impl TileForm {
             if operation == TileOp::MapTiles {
                 "GeoTIFF"
             } else {
-                "瓦片根目录"
+                message!(tile_root_folder)
             },
             &self.input,
         )?;
-        task.update(
-            if operation == TileOp::MapTiles {
-                "准备地图切片"
-            } else {
-                "扫描瓦片"
-            },
-            None,
-        );
+        task.update(if operation == TileOp::MapTiles {
+            TaskProgress::new(Phase::PrepareTiles, message!(prepare_map_tiles), None)
+        } else {
+            TaskProgress::new(Phase::ScanTiles, message!(scan_tiles), None)
+        });
         let output = match operation {
             TileOp::Mosaic => {
-                let output = required_path("GeoTIFF 输出文件", &self.output)?;
+                let output = required_path(message!(output_geotiff), &self.output)?;
                 let index = Index::scan(&input, self.scheme)?;
-                task.update("拼接 GeoTIFF", None);
+                task.update(TaskProgress::new(
+                    Phase::Mosaic,
+                    message!(mosaic_to_geotiff),
+                    None,
+                ));
                 mosaic::run_with_publish(
                     index.level(self.zoom)?,
                     self.zoom,
@@ -1112,7 +1241,7 @@ impl TileForm {
                 output
             }
             TileOp::Pyramid => {
-                let output = required_path("瓦片输出目录", &self.output)?;
+                let output = required_path(message!(tile_output_folder), &self.output)?;
                 let options = pyramid::Options {
                     scheme: self.scheme,
                     source_zoom: self.zoom,
@@ -1126,7 +1255,11 @@ impl TileForm {
                     },
                 };
                 let index = Index::scan(&input, self.scheme)?;
-                task.update("生成多级瓦片", None);
+                task.update(TaskProgress::new(
+                    Phase::Pyramid,
+                    message!(generate_tile_pyramid),
+                    None,
+                ));
                 pyramid::run_with_publish(
                     index.level(self.zoom)?,
                     &options,
@@ -1138,13 +1271,17 @@ impl TileForm {
             }
             TileOp::Stacta => {
                 let export = if self.scheme == Scheme::Tms {
-                    Some(required_path("XYZ 输出目录", &self.output)?)
+                    Some(required_path(message!(xyz_output_folder), &self.output)?)
                 } else {
                     None
                 };
                 let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
-                    .context("时间须符合 RFC 3339")?;
-                task.update("校验瓦片并生成 STACTA", None);
+                    .context(message!(time_must_follow_rfc_3339))?;
+                task.update(TaskProgress::new(
+                    Phase::CreateStacta,
+                    message!(validate_tiles_and_generate_stacta),
+                    None,
+                ));
                 stacta::run_with_publish(
                     &input,
                     self.scheme,
@@ -1157,9 +1294,9 @@ impl TileForm {
                 export.unwrap_or(input).join("stacta.json")
             }
             TileOp::MapTiles => {
-                let output = required_path("输出目录", &self.output)?;
+                let output = required_path(message!(output_folder), &self.output)?;
                 let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
-                    .context("时间须符合 RFC 3339")?;
+                    .context(message!(time_must_follow_rfc_3339))?;
                 let request = dom::map_tiles::Request {
                     input,
                     output: output.clone(),
@@ -1168,10 +1305,10 @@ impl TileForm {
                     datetime,
                     id: optional_text(&self.id),
                 };
-                let levels = dom::map_tiles::run_with_pool(
+                let levels = dom::map_tiles::run_with_progress(
                     &request,
                     &task.cancelled,
-                    |stage, fraction| task.update(stage, fraction),
+                    |event| task.update(event),
                     || task.publish_with_progress(Some(0.95)),
                     pool,
                 )?;
@@ -1182,16 +1319,25 @@ impl TileForm {
                 let details = if missing.is_empty() {
                     None
                 } else {
-                    Some(format!("以下级别没有有效瓦片：{}", missing.join("、")))
+                    Some(message!(
+                        no_valid_tiles_at_these_zoom_levels,
+                        missing.join("、")
+                    ))
                 };
                 return Ok(Outcome::Artifacts {
-                    paths: vec![output.canonicalize()?],
+                    paths: vec![output.canonicalize().with_context(|| {
+                        message!(could_not_resolve_output_path, output.display())
+                    })?],
                     details,
                 });
             }
         };
         Ok(Outcome::Artifacts {
-            paths: vec![output.canonicalize()?],
+            paths: vec![
+                output
+                    .canonicalize()
+                    .with_context(|| message!(could_not_resolve_output_path, output.display()))?,
+            ],
             details: None,
         })
     }

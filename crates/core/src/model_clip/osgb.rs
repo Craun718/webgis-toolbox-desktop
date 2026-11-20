@@ -1,5 +1,7 @@
 //! OpenSceneGraph v131 robust binary scene serialization.
 
+use crate::message;
+
 use super::mesh::{Boundary, Weights, interpolate};
 use geo::Coord;
 use std::{
@@ -115,7 +117,7 @@ fn read_scene<'a>(
         raster_coarse: false,
     };
     let result = reader.scene();
-    result.map_err(|err| format!("OSGB 0x{:x}：{err}", reader.pos))?;
+    result.map_err(|err| message!(osgb_offset_error, reader.pos, err = err))?;
     Ok(reader)
 }
 
@@ -163,42 +165,55 @@ impl Reader<'_> {
             .cancelled
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
         {
-            return Err("处理已取消".into());
+            return Err(message!(processing_canceled).into());
         }
         Ok(())
     }
     fn scene(&mut self) -> Result<(), String> {
         if self.take(8)? != [0xa1, 0x0e, 0x91, 0x6c, 0x45, 0x45, 0xfb, 0x1a] {
-            return Err("不支持的 OSGB 文件签名或字节序".into());
+            return Err(message!(unsupported_osgb_file_signature_or_byte_order).into());
         }
         let kind = self.u32()?;
         let version = self.u32()?;
         if version != 131 {
-            return Err(format!("不支持的 OSGB 序列化版本 {version}"));
+            return Err(message!(
+                unsupported_osgb_serialization_version_version,
+                version = version
+            ));
         }
         let flags = self.u32()?;
         if kind != 1 || flags != 4 {
-            return Err(format!("不支持的 OSGB 流类型 {kind} 或标志 {flags:#x}"));
+            return Err(message!(
+                unsupported_osgb_stream_type_kind_or_flags_flags,
+                kind = kind,
+                flags = flags
+            ));
         }
         let compressor = self.string()?;
         if compressor != "0" {
-            return Err(format!("不支持的 OSGB 压缩方式 {compressor}"));
+            return Err(message!(
+                unsupported_osgb_compression_method_compressor,
+                compressor = compressor
+            ));
         }
         self.node(IDENTITY)?;
         if self.pos != self.bytes.len() {
-            return Err("场景末尾有未识别的数据".into());
+            return Err(message!(unrecognized_data_at_the_end_of_the_scene).into());
         }
         Ok(())
     }
 
     fn take(&mut self, size: usize) -> Result<&[u8], String> {
-        let end = self.pos.checked_add(size).ok_or("偏移溢出")?;
+        let end = self
+            .pos
+            .checked_add(size)
+            .ok_or(message!(offset_overflow))?;
         let limit = self
             .blocks
             .last()
             .map_or(self.bytes.len(), |block| block.end);
         if end > limit {
-            return Err("数据截断或超出块长度".into());
+            return Err(message!(data_is_truncated_or_exceeds_the_block_length).into());
         }
         let start = self.pos;
         self.pos = end;
@@ -213,18 +228,19 @@ impl Reader<'_> {
         match self.take(1)?[0] {
             0 => Ok(false),
             1 => Ok(true),
-            value => Err(format!("无效布尔值 {value}")),
+            value => Err(message!(invalid_boolean_value_value, value = value)),
         }
     }
 
     fn string(&mut self) -> Result<String, String> {
         let size = self.u32()? as usize;
-        String::from_utf8(self.take(size)?.to_vec()).map_err(|_| "无效 UTF-8 字符串".into())
+        String::from_utf8(self.take(size)?.to_vec())
+            .map_err(|_| message!(invalid_utf_8_string).into())
     }
 
     fn begin(&mut self) -> Result<(), String> {
         if self.blocks.len() >= 128 {
-            return Err("场景嵌套过深".into());
+            return Err(message!(scene_nesting_is_too_deep).into());
         }
         let start = self.pos;
         let size = self.u32()? as usize;
@@ -233,7 +249,7 @@ impl Reader<'_> {
             .last()
             .map_or(self.bytes.len(), |block| block.end);
         if !(4..=limit - start).contains(&size) {
-            return Err("无效二进制块长度".into());
+            return Err(message!(invalid_binary_block_length).into());
         }
         self.blocks.push(Block {
             start,
@@ -246,11 +262,11 @@ impl Reader<'_> {
     fn end(&mut self) -> Result<(), String> {
         let block = self.blocks.pop().unwrap();
         if self.pos != block.end {
-            return Err(format!("块内剩余 {} 字节", block.end - self.pos));
+            return Err(message!(bytes_remain_in_the_block, block.end - self.pos));
         }
         if block.delta != 0 {
             let size = i32::try_from((block.end - block.start) as i64 + block.delta)
-                .map_err(|_| "输出块长度溢出")?;
+                .map_err(|_| message!(output_block_length_overflow))?;
             self.edits
                 .push((block.start..block.start + 4, size.to_le_bytes().to_vec()));
             if let Some(parent) = self.blocks.last_mut() {
@@ -272,7 +288,7 @@ impl Reader<'_> {
             let old_size = u32::from_le_bytes(self.bytes[block..block + 4].try_into().unwrap());
             let delta = replacement.len() as i64 - range.len() as i64;
             let new_size = i32::try_from(i64::from(old_size) + delta)
-                .map_err(|_| "数组块长度超出 OSGB 上限")?;
+                .map_err(|_| message!(array_block_length_exceeds_the_osgb_limit))?;
             self.edits
                 .push((block..block + 4, new_size.to_le_bytes().to_vec()));
         }
@@ -284,7 +300,7 @@ impl Reader<'_> {
     fn object(&mut self) -> Result<(String, bool), String> {
         let name = self.string()?;
         if name == "NULL" {
-            return Err("意外的空对象".into());
+            return Err(message!(unexpected_null_object).into());
         }
         self.begin()?;
         let id = self.u32()?;
@@ -296,7 +312,12 @@ impl Reader<'_> {
     fn identify(&mut self, id: u32, name: &str) -> Result<bool, String> {
         if let Some(previous) = self.ids.get(&id) {
             if previous != name {
-                return Err(format!("对象 ID {id} 同时指向 {previous} 与 {name}"));
+                return Err(message!(
+                    object_id_id_points_to_both_previous_and_name,
+                    id = id,
+                    previous = previous,
+                    name = name
+                ));
             }
             return Ok(false);
         }
@@ -318,11 +339,14 @@ impl Reader<'_> {
         if self.flag()? {
             let (class, first) = self.object()?;
             if class != "osg::DefaultUserDataContainer" {
-                return Err(format!("不支持的用户数据容器 {class}"));
+                return Err(message!(
+                    unsupported_user_data_container_class,
+                    class = class
+                ));
             }
             if first {
                 self.object_fields()?;
-                self.absent("不支持自定义用户数据")?;
+                self.absent(message!(custom_user_data_is_unsupported))?;
                 if self.flag()? {
                     let count = self.u32()?;
                     self.begin()?;
@@ -331,7 +355,7 @@ impl Reader<'_> {
                     }
                     self.end()?;
                 }
-                self.absent("不支持自定义用户对象")?;
+                self.absent(message!(custom_user_objects_are_unsupported))?;
             }
             self.end()?;
         }
@@ -351,7 +375,10 @@ impl Reader<'_> {
         self.check_cancelled()?;
         let (class, first) = self.object()?;
         if !first {
-            return Err(format!("不支持共用场景节点 {class}"));
+            return Err(message!(
+                shared_scene_node_class_is_unsupported,
+                class = class
+            ));
         }
         self.object_fields()?;
         if class == "osg::Geometry" {
@@ -362,7 +389,7 @@ impl Reader<'_> {
             self.fixed_block(32)?;
         }
         for _ in 0..4 {
-            self.absent("不支持场景节点回调")?;
+            self.absent(message!(scene_node_callbacks_are_unsupported))?;
         }
         self.flag()?;
         self.u32()?;
@@ -375,7 +402,7 @@ impl Reader<'_> {
             }
             "osg::MatrixTransform" => self.matrix_children(transform)?,
             "osg::PagedLOD" => self.paged_children(transform)?,
-            _ => return Err(format!("不支持的场景节点 {class}")),
+            _ => return Err(message!(unsupported_scene_node_class, class = class)),
         }
         self.end()
     }
@@ -418,7 +445,7 @@ impl Reader<'_> {
             || local.iter().flatten().any(|v| !v.is_finite())
             || local.map(|row| row[3]) != [0., 0., 0., 1.]
         {
-            return Err("不支持的 MatrixTransform 矩阵".into());
+            return Err(message!(unsupported_matrixtransform_matrix).into());
         }
         if let Some((start, count)) = children {
             let combined = if frame == 0 {
@@ -447,7 +474,10 @@ impl Reader<'_> {
         if self.flag()? && self.flag()? {
             let path = self.string()?;
             if !path.is_empty() {
-                return Err(format!("不支持 PagedLOD DatabasePath：{path}"));
+                return Err(message!(
+                    unsupported_pagedlod_databasepath_path,
+                    path = path
+                ));
             }
             if self.boundary.is_some() {
                 self.edit_in(
@@ -467,7 +497,9 @@ impl Reader<'_> {
                 let name = self.string()?;
                 if !name.is_empty() {
                     if transform != IDENTITY {
-                        return Err("不支持变换节点下的外部分页".into());
+                        return Err(
+                            message!(external_pages_under_transform_nodes_are_unsupported).into(),
+                        );
                     }
                     let relative = self.portable_reference(name, start..self.pos)?;
                     has_external_page = true;
@@ -510,7 +542,10 @@ impl Reader<'_> {
     fn array(&mut self) -> Result<(usize, Array), String> {
         let (class, first) = self.object()?;
         if !first {
-            return Err(format!("不支持共用网格数组 {class}"));
+            return Err(message!(
+                shared_mesh_array_class_is_unsupported,
+                class = class
+            ));
         }
         let (width, scalar) = match class.as_str() {
             "osg::Vec2Array" => (2, 4),
@@ -520,7 +555,7 @@ impl Reader<'_> {
             "osg::Vec2dArray" => (2, 8),
             "osg::Vec3dArray" => (3, 8),
             "osg::Vec4dArray" => (4, 8),
-            _ => return Err(format!("不支持的网格数组 {class}")),
+            _ => return Err(message!(unsupported_mesh_array_class, class = class)),
         };
         self.object_fields()?;
         let binding = self.u32()?;
@@ -538,7 +573,7 @@ impl Reader<'_> {
             })
             .collect();
         if values.iter().any(|v| !v.is_finite()) {
-            return Err("顶点数据包含非有限数值".into());
+            return Err(message!(vertex_data_contains_non_finite_values).into());
         }
         let range = start..self.pos;
         let block = self.blocks.last().unwrap().start;
@@ -569,7 +604,7 @@ impl Reader<'_> {
         }
         let (class, first) = self.object()?;
         if class != "osg::StateSet" {
-            return Err(format!("不支持的渲染状态 {class}"));
+            return Err(message!(unsupported_render_state_class, class = class));
         }
         let id = self.object_id;
         let inherited = self.raster.as_ref().and_then(|mesh| mesh.active);
@@ -598,12 +633,12 @@ impl Reader<'_> {
                     self.end()?;
                 }
             }
-            self.absent("不支持 Shader Uniform")?;
+            self.absent(message!(shader_uniform_is_unsupported))?;
             self.take(12)?;
             self.string()?;
             self.flag()?;
-            self.absent("不支持渲染状态更新回调")?;
-            self.absent("不支持渲染状态事件回调")?;
+            self.absent(message!(render_state_update_callbacks_are_unsupported))?;
+            self.absent(message!(render_state_event_callbacks_are_unsupported))?;
             if let Some(mesh) = &mut self.raster {
                 mesh.states.insert(id, mesh.active);
             }
@@ -634,8 +669,8 @@ impl Reader<'_> {
                 "osg::Material" => {
                     if first {
                         self.object_fields()?;
-                        self.absent("不支持材质更新回调")?;
-                        self.absent("不支持材质事件回调")?;
+                        self.absent(message!(material_update_callbacks_are_unsupported))?;
+                        self.absent(message!(material_event_callbacks_are_unsupported))?;
                         self.u32()?;
                         for size in [32, 32, 32, 32, 8] {
                             if self.flag()? {
@@ -647,7 +682,10 @@ impl Reader<'_> {
                 }
                 "osg::Texture2D" => {
                     if self.raster.is_some() && unit != Some(0) {
-                        return Err(format!("不支持纹理单元 {unit:?} 上的 Texture2D"));
+                        return Err(message!(
+                            texture2d_on_texture_unit_unit_is_unsupported,
+                            unit = unit
+                        ));
                     }
                     let id = self.object_id;
                     let image = if first { Some(self.texture()?) } else { None };
@@ -658,7 +696,12 @@ impl Reader<'_> {
                         mesh.active = Some(mesh.textures[&id]);
                     }
                 }
-                _ => return Err(format!("不支持的材质属性 {class}")),
+                _ => {
+                    return Err(message!(
+                        unsupported_material_attribute_class,
+                        class = class
+                    ));
+                }
             }
             self.end()?;
             self.u32()?;
@@ -668,8 +711,8 @@ impl Reader<'_> {
 
     fn texture(&mut self) -> Result<u32, String> {
         self.object_fields()?;
-        self.absent("不支持纹理更新回调")?;
-        self.absent("不支持纹理事件回调")?;
+        self.absent(message!(texture_update_callbacks_are_unsupported))?;
+        self.absent(message!(texture_event_callbacks_are_unsupported))?;
         for _ in 0..5 {
             if self.flag()? {
                 self.u32()?;
@@ -682,18 +725,21 @@ impl Reader<'_> {
             }
         }
         self.take(13)?;
-        self.absent("不支持纹理 ImageAttachment")?;
+        self.absent(message!(texture_imageattachment_is_unsupported))?;
         if self.flag()? {
             let swizzle = self.string()?;
             if swizzle.len() != 4 {
-                return Err("无效的纹理 Swizzle".into());
+                return Err(message!(invalid_texture_swizzle).into());
             }
             if self.raster.is_some() && !swizzle.eq_ignore_ascii_case("rgba") {
-                return Err(format!("不支持的纹理通道映射 {swizzle}"));
+                return Err(message!(
+                    unsupported_texture_channel_mapping_swizzle,
+                    swizzle = swizzle
+                ));
             }
         }
         if !self.flag()? {
-            return Err("Texture2D 缺少图像".into());
+            return Err(message!(texture2d_is_missing_an_image).into());
         }
         let image = self.image()?;
         self.take(8)?;
@@ -703,7 +749,7 @@ impl Reader<'_> {
     fn image(&mut self) -> Result<u32, String> {
         let class = self.string()?;
         if class != "osg::Image" {
-            return Err(format!("不支持图像类型 {class}"));
+            return Err(message!(unsupported_image_type_class, class = class));
         }
         let id = self.u32()?;
         if !self.identify(id, &class)? {
@@ -716,12 +762,15 @@ impl Reader<'_> {
         match self.u32()? {
             0 => {
                 if self.raster.is_some() {
-                    return Err(format!("纹理 {name} 使用不支持的原始像素存储"));
+                    return Err(message!(
+                        texture_name_uses_an_unsupported_raw_pixel_layout,
+                        name = name
+                    ));
                 }
                 self.take(36)?;
                 let size = self.u32()? as usize;
                 if size == 0 {
-                    return Err(format!("纹理 {name} 没有像素数据"));
+                    return Err(message!(texture_name_has_no_pixel_data, name = name));
                 }
                 self.take(size)?;
                 let mipmaps = self.u32()? as usize;
@@ -730,7 +779,7 @@ impl Reader<'_> {
             1 => {
                 let size = self.u32()? as usize;
                 if size == 0 {
-                    return Err(format!("纹理 {name} 没有内嵌数据"));
+                    return Err(message!(texture_name_has_no_embedded_data, name = name));
                 }
                 let start = self.pos;
                 self.take(size)?;
@@ -747,7 +796,7 @@ impl Reader<'_> {
             }
             2 | 3 => {
                 if name.is_empty() {
-                    return Err("外部纹理缺少文件名".into());
+                    return Err(message!(external_texture_has_no_file_name).into());
                 }
                 let relative = self.portable_reference(name, start..end)?;
                 if let Some(mesh) = &mut self.raster {
@@ -756,7 +805,12 @@ impl Reader<'_> {
                 }
                 self.textures.push(relative);
             }
-            kind => return Err(format!("不支持的纹理存储方式 {kind}")),
+            kind => {
+                return Err(message!(
+                    unsupported_texture_storage_method_kind,
+                    kind = kind
+                ));
+            }
         }
         self.object_fields()?;
         Ok(id)
@@ -779,13 +833,13 @@ impl Reader<'_> {
         if self.flag()? {
             self.fixed_block(48)?;
         }
-        self.absent("不支持 Drawable 包围盒回调")?;
-        self.absent("不支持 Drawable Shape")?;
+        self.absent(message!(drawable_bounding_box_callbacks_are_unsupported))?;
+        self.absent(message!(drawable_shape_is_unsupported))?;
         for _ in 0..3 {
             self.flag()?;
         }
         for _ in 0..4 {
-            self.absent("不支持 Drawable 回调")?;
+            self.absent(message!(drawable_callbacks_are_unsupported))?;
         }
         let count_offset = self.pos;
         let primitive_count = self.u32()?;
@@ -795,18 +849,23 @@ impl Reader<'_> {
             let start = self.pos;
             let (class, first) = self.object()?;
             if !first {
-                return Err(format!("不支持共用索引 {class}"));
+                return Err(message!(
+                    shared_indices_class_are_unsupported,
+                    class = class
+                ));
             }
             let size = match class.as_str() {
                 "osg::DrawElementsUByte" => 1,
                 "osg::DrawElementsUShort" => 2,
                 "osg::DrawElementsUInt" => 4,
-                _ => return Err(format!("不支持的图元 {class}")),
+                _ => return Err(message!(unsupported_primitive_class, class = class)),
             };
             let fields = self.pos - 4;
             self.object_fields()?;
             if self.u32()? > 1 || self.u32()? != 4 {
-                return Err("仅支持非实例化的 GL_TRIANGLES 图元".into());
+                return Err(
+                    message!(only_non_instanced_gl_triangles_primitives_are_supported).into(),
+                );
             }
             let header_end = self.pos;
             let count = self.u32()? as usize;
@@ -820,14 +879,14 @@ impl Reader<'_> {
                 })
                 .collect();
             if !count.is_multiple_of(3) {
-                return Err("索引数量不是三的倍数".into());
+                return Err(message!(index_count_is_not_a_multiple_of_three).into());
             }
             self.end()?;
             primitives.push((start..self.pos, fields..header_end, indices));
         }
         let vertices = self.optional_array()?;
         if vertices.is_none() && primitive_count != 0 {
-            return Err("缺少位置数组".into());
+            return Err(message!(missing_position_array).into());
         }
         let mut arrays = Vec::new();
         for kind in 0..4 {
@@ -839,14 +898,14 @@ impl Reader<'_> {
             arrays.push((4, self.array()?));
         }
         if self.u32()? != 0 {
-            return Err("不支持自定义顶点属性".into());
+            return Err(message!(custom_vertex_attributes_are_unsupported).into());
         }
         let Some((vertex_block, vertices)) = vertices else {
             // 分页节点可以内嵌无图元的空几何。
             return Ok(());
         };
         if vertices.width != 3 {
-            return Err("位置数组必须为三维".into());
+            return Err(message!(position_arrays_must_be_three_dimensional).into());
         }
         let vertex_count = vertices.values.len() / 3;
         for (_, (_, array)) in &arrays {
@@ -856,7 +915,7 @@ impl Reader<'_> {
             if !matches!(array.binding, 4 | u32::MAX)
                 || array.values.len() / array.width != vertex_count
             {
-                return Err(format!("不支持的顶点数组绑定 {}", array.binding));
+                return Err(message!(unsupported_vertex_array_binding, array.binding));
             }
         }
         let uv = arrays
@@ -869,7 +928,7 @@ impl Reader<'_> {
             .is_some_and(|mesh| mesh.active.is_some())
             && !uv.is_some_and(|array| array.width == 2 && array.binding != 1)
         {
-            return Err("纹理网格缺少逐顶点 UV".into());
+            return Err(message!(textured_mesh_is_missing_per_vertex_uv_coordinates).into());
         }
         let mut samples = Vec::new();
         for (range, header, indices) in primitives {
@@ -880,7 +939,7 @@ impl Reader<'_> {
                 }
                 let ids = [face[0], face[1], face[2]];
                 if ids.iter().any(|&id| id >= vertex_count) {
-                    return Err("索引超出顶点范围".into());
+                    return Err(message!(index_is_outside_the_vertex_range).into());
                 }
                 if let Some(mesh) = &mut self.raster
                     && !self.raster_coarse
@@ -895,7 +954,7 @@ impl Reader<'_> {
                         })
                     });
                     if xyz.iter().flatten().any(|v| !v.is_finite()) {
-                        return Err("模型变换后的坐标超出范围".into());
+                        return Err(message!(transformed_model_coordinates_are_out_of_range).into());
                     }
                     let uv = uv
                         .filter(|array| array.width == 2 && array.binding != 1)
@@ -923,7 +982,7 @@ impl Reader<'_> {
                         }
                     });
                     if xy.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
-                        return Err("模型变换后的坐标超出范围".into());
+                        return Err(message!(transformed_model_coordinates_are_out_of_range).into());
                     }
                     for clipped in boundary.clip(xy) {
                         samples.extend(clipped.map(|weights| (ids, weights)));
@@ -931,7 +990,8 @@ impl Reader<'_> {
                 }
             }
             if self.boundary.is_some() {
-                let last = u32::try_from(samples.len()).map_err(|_| "顶点数量超过 OSGB 上限")?;
+                let last = u32::try_from(samples.len())
+                    .map_err(|_| message!(vertex_count_exceeds_the_osgb_limit))?;
                 let first = first as u32;
                 if last == first {
                     // OSG may dereference the first index even for zero indices.
@@ -944,7 +1004,7 @@ impl Reader<'_> {
                 push_u32(&mut primitive, class.len() as u32);
                 primitive.extend_from_slice(class);
                 let size = i32::try_from(4usize + header.len() + 4 + ((last - first) as usize) * 4)
-                    .map_err(|_| "索引块长度超过 OSGB 上限")?;
+                    .map_err(|_| message!(index_block_length_exceeds_the_osgb_limit))?;
                 primitive.extend_from_slice(&size.to_le_bytes());
                 primitive.extend_from_slice(&self.bytes[header]);
                 push_u32(&mut primitive, last - first);

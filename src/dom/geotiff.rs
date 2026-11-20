@@ -3,6 +3,7 @@ use proj4rs::proj::Proj;
 use regex::Regex;
 use std::sync::LazyLock;
 use tiff::{decoder::IfdDecoder, encoder::DirectoryEncoder, tags::Tag};
+use webgis_core::message;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Crs {
@@ -17,7 +18,12 @@ impl Crs {
             Some((prefix, code)) if prefix.eq_ignore_ascii_case("EPSG") => code.trim().parse().ok(),
             _ => wkt_epsg(value),
         };
-        Self::from_code(code.with_context(|| format!("坐标系缺少可识别的顶层 EPSG 标识：{value}"))?)
+        Self::from_code(code.with_context(|| {
+            message!(
+                crs_has_no_recognizable_top_level_epsg_identifier_value,
+                value = value
+            )
+        })?)
     }
 
     pub fn from_code(code: u16) -> Result<Self> {
@@ -30,20 +36,34 @@ impl Crs {
 }
 
 pub(super) fn projection(code: u16) -> Result<Proj> {
-    let definition =
-        crs_definitions::from_code(code).with_context(|| format!("没有内置的 EPSG:{code} 定义"))?;
+    let definition = crs_definitions::from_code(code)
+        .with_context(|| message!(no_built_in_definition_for_epsg_code, code = code))?;
     let grid = definition.proj4.split_ascii_whitespace().find(|part| {
         (part.starts_with("+nadgrids=") && *part != "+nadgrids=@null")
             || part.starts_with("+geoidgrids=")
             || *part == "+datum=NAD27"
     });
-    ensure!(grid.is_none(), "EPSG:{code} 需要外部坐标转换格网");
+    ensure!(
+        grid.is_none(),
+        message!(
+            epsg_code_requires_an_external_transformation_grid,
+            code = code
+        )
+    );
     let text = definition.proj4.replace("+nadgrids=@null", "");
-    let proj = Proj::from_proj_string(&text)
-        .map_err(|err| anyhow::anyhow!("无法使用 EPSG:{code}：{err}"))?;
+    let proj = Proj::from_proj_string(&text).map_err(|err| {
+        anyhow::anyhow!(message!(
+            could_not_use_epsg_code_err,
+            code = code,
+            err = err
+        ))
+    })?;
     ensure!(
         proj.has_forward() && proj.has_inverse() && !proj.is_geocent() && proj.is_normalized_axis(),
-        "EPSG:{code} 不支持经纬度或东、北轴平面坐标"
+        message!(
+            epsg_code_does_not_use_longitude_latitude_or_easting_northing_axes,
+            code = code
+        )
     );
     Ok(proj)
 }
@@ -101,7 +121,10 @@ impl Affine {
     pub fn inverse(self) -> Result<Self> {
         let [a, b, c, d, e, f] = self.0;
         let det = b * f - c * e;
-        ensure!(det.is_finite() && det != 0.0, "地理定位仿射矩阵不可逆");
+        ensure!(
+            det.is_finite() && det != 0.0,
+            message!(georeferencing_affine_matrix_is_not_invertible)
+        );
         let inverse = Self([
             (c * d - f * a) / det,
             f / det,
@@ -112,7 +135,7 @@ impl Affine {
         ]);
         ensure!(
             inverse.0.iter().all(|v| v.is_finite()),
-            "地理定位仿射矩阵包含无效值"
+            message!(georeferencing_affine_matrix_contains_invalid_values)
         );
         Ok(inverse)
     }
@@ -121,11 +144,14 @@ impl Affine {
 pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
     let keys = tags
         .find_tag(Tag::GeoKeyDirectoryTag)?
-        .context("缺少坐标系 GeoKey")?
+        .context(message!(missing_crs_geokey))?
         .into_u16_vec()?;
-    ensure!(keys.len() >= 4 && keys[0] == 1, "无效的 GeoKey 目录");
+    ensure!(
+        keys.len() >= 4 && keys[0] == 1,
+        message!(invalid_geokey_directory)
+    );
     let end = 4 + usize::from(keys[3]) * 4;
-    ensure!(end <= keys.len(), "GeoKey 目录不完整");
+    ensure!(end <= keys.len(), message!(geokey_directory_is_incomplete));
     let key = |id| {
         keys[4..end].chunks_exact(4).find_map(|entry| {
             (entry[0] == id && entry[1] == 0 && entry[2] == 1).then_some(entry[3])
@@ -139,12 +165,11 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
     };
     let crs = Crs::from_code(
         code.filter(|&code| code != 32767 && code != 0)
-            .context("坐标系 GeoKey 缺少可识别的 EPSG 标识")?,
+            .context(message!(crs_geokey_has_no_recognizable_epsg_identifier))?,
     )?;
     ensure!(
         crs.geographic == geographic,
-        "EPSG:{} 与 GeoKey 坐标类型不符",
-        crs.code
+        message!(epsg_does_not_match_the_geokey_coordinate_type, crs.code)
     );
     let mut transform = if let Some(value) = tags.find_tag(Tag::ModelTransformationTag)? {
         let matrix = value.into_f64_vec()?;
@@ -152,7 +177,7 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
             matrix.len() == 16
                 && matrix.iter().all(|v| v.is_finite())
                 && matrix[12..] == [0., 0., 0., 1.],
-            "无效的 ModelTransformation 仿射矩阵"
+            message!(invalid_modeltransformation_affine_matrix)
         );
         Affine([
             matrix[3], matrix[0], matrix[1], matrix[7], matrix[4], matrix[5],
@@ -160,15 +185,17 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
     } else {
         let scale = tags
             .find_tag(Tag::ModelPixelScaleTag)?
-            .context("缺少地理定位 ModelPixelScale 或 ModelTransformation")?
+            .context(message!(
+                missing_georeferencing_modelpixelscale_or_modeltransformation
+            ))?
             .into_f64_vec()?;
         let tie = tags
             .find_tag(Tag::ModelTiepointTag)?
-            .context("缺少地理定位 ModelTiepoint")?
+            .context(message!(missing_georeferencing_modeltiepoint))?
             .into_f64_vec()?;
         ensure!(
             scale.len() == 3 && tie.len() >= 6 && tie.len() % 6 == 0,
-            "无效的像元比例或控制点"
+            message!(invalid_pixel_scale_or_tie_points)
         );
         Affine([
             tie[3] - tie[0] * scale[0],
@@ -186,7 +213,7 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
             transform.0[0] = x;
             transform.0[3] = y;
         }
-        _ => anyhow::bail!("不支持的 GeoTIFF 像元定位类型"),
+        _ => anyhow::bail!(message!(unsupported_geotiff_raster_pixel_type)),
     }
     transform.inverse()?;
     Ok((crs, transform))
