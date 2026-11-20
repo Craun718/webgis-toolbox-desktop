@@ -5,6 +5,13 @@ mod console;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    if std::env::args_os().nth(1).as_deref() == Some(app::osgb_worker::ARGUMENT.as_ref()) {
+        if let Err(error) = app::osgb_worker::run() {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     with_language(app::startup_language(), run)
 }
 

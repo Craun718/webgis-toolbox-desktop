@@ -5,6 +5,7 @@ use webgis_core::{
 };
 use webgis_toolbox::dom::{self, Phase, TaskProgress};
 mod file_dialog;
+pub(crate) mod osgb_worker;
 mod settings;
 mod task;
 mod terrain;
@@ -150,26 +151,7 @@ impl App {
             (Tool::Raster, Action::Preview | Action::Run) => {
                 let request = self.raster.request()?;
                 Worker::start(ctx, &name, true, move |task| {
-                    let update = |event| task.update(event);
-                    if action == Action::Preview {
-                        Ok(Outcome::RasterPreview(dom::preflight_with_progress(
-                            &request,
-                            &task.cancelled,
-                            update,
-                        )?))
-                    } else {
-                        let pool = processing_pool(threads)?;
-                        Ok(Outcome::Artifacts {
-                            paths: dom::run_with_progress(
-                                &request,
-                                &task.cancelled,
-                                update,
-                                || task.publish_with_progress(Some(0.95)),
-                                pool.as_ref(),
-                            )?,
-                            details: None,
-                        })
-                    }
+                    osgb_worker::raster(request, action == Action::Preview, threads, task)
                 })?
             }
             (Tool::Terrain, Action::Run) => self.terrain.start(ctx, &name)?,
@@ -207,47 +189,7 @@ impl App {
             (Tool::Clip, Action::Preview | Action::Run) => {
                 let request = self.clip.request()?;
                 Worker::start(ctx, &name, true, move |task| {
-                    task.update(TaskProgress::new(
-                        Phase::CheckClip,
-                        message!(check_model_boundary_and_output),
-                        None,
-                    ));
-                    if action == Action::Preview {
-                        return clip::preflight_cancelable(&request, &task.cancelled)
-                            .map(Outcome::ClipPreview)
-                            .map_err(|e| anyhow!(e));
-                    }
-                    let pool = processing_pool(threads)?;
-                    let result = clip::run_with_pool(
-                        &request,
-                        &task.cancelled,
-                        |p| {
-                            task.update(TaskProgress::new(
-                                Phase::ClipModel,
-                                message!(
-                                    clipping_processed_models_found,
-                                    p.file.display(),
-                                    p.completed,
-                                    p.discovered
-                                ),
-                                None,
-                            ));
-                        },
-                        || task.publish().map_err(|err| err.to_string()),
-                        pool.as_ref(),
-                    )
-                    .map_err(|e| anyhow!(e))?;
-                    let details = message!(
-                        wrote_osgb_files_with_triangles,
-                        result.files,
-                        result.triangles
-                    );
-                    Ok(Outcome::Artifacts {
-                        paths: std::iter::once(result.output)
-                            .chain(result.entries)
-                            .collect(),
-                        details: Some(details),
-                    })
+                    osgb_worker::clip(request, action == Action::Preview, threads, task)
                 })?
             }
             (Tool::Tiles(operation), Action::Run) => {

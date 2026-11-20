@@ -128,6 +128,15 @@ impl TaskContext {
         self.egui.request_repaint_of(egui::ViewportId::ROOT);
     }
 
+    pub(super) fn log(&self, message: &str) {
+        self.control
+            .state
+            .lock()
+            .unwrap()
+            .log(console::Level::Info, message);
+        self.egui.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
     pub(super) fn publish(&self) -> Result<()> {
         self.publish_with_progress(None)
     }
