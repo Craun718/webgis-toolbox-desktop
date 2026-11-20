@@ -41,11 +41,11 @@ impl TaskState {
             final_status: None,
             logs: VecDeque::new(),
         };
-        state.log("INFO", "任务开始");
+        state.log(console::Level::Info, "任务开始");
         state
     }
 
-    fn log(&mut self, level: &str, message: &str) {
+    fn log(&mut self, level: console::Level, message: &str) {
         if self.logs.len() == LOG_LIMIT {
             self.logs.pop_front();
         }
@@ -66,7 +66,7 @@ impl TaskState {
                 Some(fraction) => format!("{}（{:.0}%）", self.stage.name, fraction * 100.0),
                 None => self.stage.name.clone(),
             };
-            self.log("INFO", &message);
+            self.log(console::Level::Info, &message);
             self.last_progress_log = Some(now);
         }
     }
@@ -77,15 +77,15 @@ impl TaskState {
             && !self.stage.publishing
             && !control.cancelled.swap(true, Ordering::Relaxed)
         {
-            self.log("INFO", "已请求取消，等待后台任务退出");
+            self.log(console::Level::Info, "已请求取消，等待后台任务退出");
         }
     }
 
     fn finish(&mut self, result: &Result<Outcome>) {
         let (status, level) = match result {
-            Ok(Outcome::Cancelled) => ("任务已取消", "INFO"),
-            Ok(_) => ("任务已完成", "INFO"),
-            Err(_) => ("任务失败", "ERROR"),
+            Ok(Outcome::Cancelled) => ("任务已取消", console::Level::Info),
+            Ok(_) => ("任务已完成", console::Level::Info),
+            Err(_) => ("任务失败", console::Level::Error),
         };
         self.final_status = Some(status);
         match result {
@@ -135,11 +135,11 @@ impl TaskContext {
         let mut state = self.control.state.lock().unwrap();
         ensure!(!self.cancelled.load(Ordering::Relaxed), "处理已取消");
         state.stage = Stage {
-            name: "发布结果".into(),
+            name: "保存结果".into(),
             fraction,
             publishing: true,
         };
-        state.log("INFO", "发布结果");
+        state.log(console::Level::Info, "保存结果");
         drop(state);
         self.egui.request_repaint_of(egui::ViewportId::ROOT);
         Ok(())
@@ -317,12 +317,29 @@ impl TaskWindow {
 
         ui.separator();
         let mut read_only = log.as_str();
+        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width| {
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = wrap_width;
+            let normal = egui::TextFormat::simple(font_id.clone(), ui.visuals().text_color());
+            let error = egui::TextFormat::simple(font_id.clone(), ui.visuals().error_fg_color);
+            for line in text.as_str().split_inclusive('\n') {
+                if let Some(body) = line.strip_prefix(console::Level::ERROR_LABEL) {
+                    job.append(console::Level::ERROR_LABEL, 0.0, error.clone());
+                    job.append(body, 0.0, normal.clone());
+                } else {
+                    job.append(line, 0.0, normal.clone());
+                }
+            }
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
         egui::ScrollArea::both()
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut read_only)
                         .code_editor()
+                        .layouter(&mut layouter)
                         .desired_rows(1)
                         .desired_width(f32::INFINITY),
                 );
@@ -376,7 +393,7 @@ mod tests {
         let worker = Worker::start(&egui::Context::default(), "预检", true, move |task| {
             wait.recv_timeout(Duration::from_secs(5))?;
             task.publish()?;
-            unreachable!("收到取消请求后不能发布结果");
+            unreachable!("收到取消请求后不能保存结果");
         })
         .unwrap();
 
@@ -421,7 +438,7 @@ mod tests {
             let mut state = worker.control.state.lock().unwrap();
             assert!(state.stage.publishing);
             assert_eq!(state.stage.fraction, Some(0.95));
-            assert!(state.logs[1].ends_with("发布结果"));
+            assert!(state.logs[1].ends_with("保存结果"));
             state.request_cancel(&worker.control);
             assert!(!worker.control.cancelled.load(Ordering::Relaxed));
             assert_eq!(state.logs.len(), 2);
@@ -456,14 +473,13 @@ mod tests {
                 .is_err()
         );
         let state = worker.control.state.lock().unwrap();
-        assert!(
-            state.logs[1].contains("[ERROR] 扫描 | 任务失败：无法读取输入: 扫描失败: 打开文件")
-        );
+        assert!(state.logs[1].starts_with("[ERRO] "));
+        assert!(state.logs[1].ends_with("扫描 | 任务失败：无法读取输入: 扫描失败: 打开文件"));
 
         let mut next = TaskState::new("处理");
         assert_eq!(next.logs.len(), 1);
         for index in 0..LOG_LIMIT {
-            next.log("INFO", &index.to_string());
+            next.log(console::Level::Info, &index.to_string());
         }
         assert_eq!(next.logs.len(), LOG_LIMIT);
         assert!(next.logs[0].ends_with(" | 0"));

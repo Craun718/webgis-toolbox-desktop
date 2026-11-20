@@ -4,7 +4,7 @@ mod console;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    console::record("INFO", "WebGIS 工具箱", "启动软件");
+    console::record(console::Level::Info, "WebGIS 工具箱", "启动软件");
     let result = eframe::run_native(
         "WebGIS 工具箱",
         eframe::NativeOptions {
@@ -17,7 +17,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx)))),
     );
     match &result {
-        Ok(()) => console::record("INFO", "WebGIS 工具箱", "退出软件"),
+        Ok(()) => console::record(console::Level::Info, "WebGIS 工具箱", "退出软件"),
         Err(error) => {
             let mut message = format!("启动失败：{error}");
             let mut cause = std::error::Error::source(error);
@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
                 message.push_str(&format!("：{error}"));
                 cause = error.source();
             }
-            console::record("ERROR", "WebGIS 工具箱", &message)
+            console::record(console::Level::Error, "WebGIS 工具箱", &message)
         }
     };
     result

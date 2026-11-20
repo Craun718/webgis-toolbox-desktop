@@ -1,8 +1,7 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::Local;
 use std::{
     io::{self, IsTerminal, Write},
     sync::OnceLock,
-    time::SystemTime,
 };
 
 enum Terminal {
@@ -11,10 +10,28 @@ enum Terminal {
     None,
 }
 
-pub fn record(level: &str, source: &str, message: &str) -> String {
-    let timestamp =
-        DateTime::<Utc>::from(SystemTime::now()).to_rfc3339_opts(SecondsFormat::Millis, true);
-    let line = format!("{timestamp} [{level}] {source} | {message}");
+#[derive(Clone, Copy)]
+pub enum Level {
+    Info,
+    Error,
+}
+
+impl Level {
+    pub const ERROR_LABEL: &str = "[ERRO]";
+}
+
+pub fn record(level: Level, source: &str, message: &str) -> String {
+    let label = match level {
+        Level::Info => "[INFO]",
+        Level::Error => Level::ERROR_LABEL,
+    };
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let body = format!("{timestamp} {source} | {message}");
+    let line = format!("{label} {body}");
+    let write_line = |writer: &mut dyn Write| match level {
+        Level::Info => writeln!(writer, "{line}"),
+        Level::Error => writeln!(writer, "\x1b[31m{label}\x1b[0m {body}"),
+    };
     static TERMINAL: OnceLock<Terminal> = OnceLock::new();
     match TERMINAL.get_or_init(|| {
         if io::stderr().is_terminal() {
@@ -26,10 +43,10 @@ pub fn record(level: &str, source: &str, message: &str) -> String {
         }
     }) {
         Terminal::Stderr => {
-            let _ = writeln!(io::stderr().lock(), "{line}");
+            let _ = write_line(&mut io::stderr().lock());
         }
         Terminal::Stdout => {
-            let _ = writeln!(io::stdout().lock(), "{line}");
+            let _ = write_line(&mut io::stdout().lock());
         }
         Terminal::None => {}
     }

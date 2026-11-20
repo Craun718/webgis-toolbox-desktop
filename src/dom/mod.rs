@@ -16,6 +16,7 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -211,9 +212,17 @@ fn prepare(
         stage: "扫描 OSGB 与元数据".into(),
         fraction: None,
     });
+    let input_metadata = match fs::metadata(&request.input) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            bail!("输入文件不存在：{}", request.input.display());
+        }
+        result => {
+            result.with_context(|| format!("无法检查输入文件：{}", request.input.display()))?
+        }
+    };
     let metadata_input = is_metadata_file(&request.input);
     ensure!(
-        request.input.is_file() && (metadata_input || is_osgb(&request.input)),
+        input_metadata.is_file() && (metadata_input || is_osgb(&request.input)),
         "请选择根 OSGB 文件或 metadata.xml"
     );
     let input = request

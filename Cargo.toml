@@ -14,7 +14,7 @@ webgis-core = { path = "crates/core", features = ["model-clip"] }
 tiles-toolbox = { path = "crates/tiles" }
 anyhow = "1"
 serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 crs-definitions = { version = "0.4", default-features = false, features = ["proj4"] }

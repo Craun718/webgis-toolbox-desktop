@@ -186,6 +186,13 @@ fn accepts_root_osgb_and_rejects_other_model_inputs() {
         let error = prepare(&request, &flag, &mut |_| {}).err().unwrap();
         assert_eq!(error.to_string(), "请选择根 OSGB 文件或 metadata.xml");
     }
+
+    request.input = metadata.with_file_name("missing.osgb");
+    let error = prepare(&request, &flag, &mut |_| {}).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!("输入文件不存在：{}", request.input.display())
+    );
 }
 
 #[test]
