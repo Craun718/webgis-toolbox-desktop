@@ -14,7 +14,7 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 webgis-core = { path = "crates/core", features = ["model-clip"] }
 tiles-toolbox = { path = "crates/tiles" }
 anyhow = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -26,6 +26,7 @@ weezl = "0.1.12"
 quick-xml = "0.41"
 regex = "1"
 rstar = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
 walkdir = "2"

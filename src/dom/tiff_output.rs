@@ -16,7 +16,7 @@ use tiff::{
     encoder::{DirectoryEncoder, TiffEncoder, TiffKindBig},
     tags::Tag,
 };
-use webgis_core::message;
+use webgis_core::{message, osgb_memory as memory};
 
 pub(super) const TILE: usize = 256;
 pub(super) const NODATA: f32 = -9999.;
@@ -202,6 +202,21 @@ fn decoder(path: &Path) -> Result<Decoder<BufReader<File>>> {
     Ok(Decoder::new(BufReader::new(File::open(path)?))?)
 }
 
+pub(super) fn wait_for_memory(cancelled: &AtomicBool, paths: &[&Path]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if memory::pressure() {
+        // Completed TIFF blocks can remain cgroup-charged as file cache.
+        // Sync before advising the kernel to release those pages.
+        for path in paths {
+            if let Ok(file) = File::open(path) {
+                file.sync_data()?;
+                let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed);
+            }
+        }
+    }
+    memory::wait(cancelled).map_err(anyhow::Error::msg)
+}
+
 pub(super) fn overviews(
     file: &mut BigTiff,
     path: &Path,
@@ -231,6 +246,7 @@ pub(super) fn overviews(
         let [cols, rows] = spec.tile_grid();
         for y in 0..rows {
             for x in 0..cols {
+                wait_for_memory(cancelled, &[path])?;
                 let aggregate = source.aggregate([x, y], factor)?;
                 if kind == RasterKind::Dsm {
                     let data: Vec<_> = aggregate
@@ -390,6 +406,7 @@ pub(super) fn verify(
         }
         for index in 0..count {
             check_cancelled(cancelled)?;
+            wait_for_memory(cancelled, &[path])?;
             match ds.read_chunk(index)? {
                 DecodingResult::F32(data) if kind == RasterKind::Dsm => {
                     valid += data.iter().filter(|&&value| value != NODATA).count() as u64;
@@ -413,6 +430,7 @@ pub(super) fn verify(
             );
             for index in 0..mask.count() {
                 check_cancelled(cancelled)?;
+                wait_for_memory(cancelled, &[path])?;
                 valid += mask
                     .read_chunk(&mut reader, index)?
                     .iter()

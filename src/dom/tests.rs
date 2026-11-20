@@ -66,6 +66,10 @@ fn state(id: u32, source: Texture<'_>) -> Vec<u8> {
 }
 
 fn geometry(id: u32, height: f32, source: Texture<'_>) -> Vec<u8> {
+    geometry_with_faces(id, height, source, 1)
+}
+
+fn geometry_with_faces(id: u32, height: f32, source: Texture<'_>, faces: u32) -> Vec<u8> {
     let array = |values: &[f32]| {
         let mut out = 4u32.to_le_bytes().to_vec();
         out.extend([0, 0]);
@@ -80,7 +84,10 @@ fn geometry(id: u32, height: f32, source: Texture<'_>) -> Vec<u8> {
     body.extend([0, 0, 0, 1, 1, 0, 0, 0, 0, 0]);
     append_u32(&mut body, &[1]);
     let mut indices = Vec::new();
-    append_u32(&mut indices, &[0, 4, 3, 0, 1, 2]);
+    append_u32(&mut indices, &[0, 4, 3 * faces]);
+    for _ in 0..faces {
+        append_u32(&mut indices, &[0, 1, 2]);
+    }
     body.extend(object("osg::DrawElementsUInt", id + 1, &indices));
     body.push(1);
     body.extend(object(
@@ -100,6 +107,10 @@ fn geometry(id: u32, height: f32, source: Texture<'_>) -> Vec<u8> {
 }
 
 fn fixture(input: &Path) -> Vec<u8> {
+    fixture_with_faces(input, 1)
+}
+
+fn fixture_with_faces(input: &Path, faces: u32) -> Vec<u8> {
     let mut png = Cursor::new(Vec::new());
     RgbaImage::from_fn(1, 2, |_, row| {
         if row == 0 {
@@ -113,8 +124,13 @@ fn fixture(input: &Path) -> Vec<u8> {
     RgbImage::from_pixel(1, 1, Rgb([0, 240, 0]))
         .save(input.join("lower.jpg"))
         .unwrap();
-    let mut children = geometry(10, 1., Texture::File("lower.jpg"));
-    children.extend(geometry(20, 4., Texture::Inline(png.get_ref())));
+    let mut children = geometry_with_faces(10, 1., Texture::File("lower.jpg"), faces);
+    children.extend(geometry_with_faces(
+        20,
+        4.,
+        Texture::Inline(png.get_ref()),
+        faces,
+    ));
     let mut body = vec![0, 0, 0, 0, 0, 1];
     append_u32(&mut body, &[u32::MAX]);
     body.extend([0, 1]);
@@ -175,7 +191,7 @@ fn accepts_root_osgb_and_rejects_other_model_inputs() {
     let flag = AtomicBool::new(false);
 
     request.input = root_osgb.clone();
-    let (summary, _, _) = prepare(&request, &flag, &mut |_| {}).unwrap();
+    let (summary, _, _) = prepare(&request, &flag, &mut |_| {}, Storage::Memory).unwrap();
     assert_eq!(summary.selected, [root_osgb]);
     assert_eq!(summary.metadata.as_ref(), Some(&metadata));
 
@@ -183,12 +199,16 @@ fn accepts_root_osgb_and_rejects_other_model_inputs() {
     fs::copy(&metadata, &other_xml).unwrap();
     for invalid in [metadata.parent().unwrap().to_owned(), other_xml] {
         request.input = invalid;
-        let error = prepare(&request, &flag, &mut |_| {}).err().unwrap();
+        let error = prepare(&request, &flag, &mut |_| {}, Storage::Memory)
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), "请选择根 OSGB 文件或 metadata.xml");
     }
 
     request.input = metadata.with_file_name("missing.osgb");
-    let error = prepare(&request, &flag, &mut |_| {}).err().unwrap();
+    let error = prepare(&request, &flag, &mut |_| {}, Storage::Memory)
+        .err()
+        .unwrap();
     assert_eq!(
         error.to_string(),
         format!("输入文件不存在：{}", request.input.display())
@@ -268,6 +288,43 @@ fn follows_mixed_lod_pages_and_discards_embedded_coarse_geometry() {
         assert_eq!(summary.selected, [low.clone(), high.clone()]);
         assert_eq!(summary.triangles, 4);
         assert_eq!(summary.bounds, [112., 218., 23., 116., 222., 26.]);
+        let mut progress = Vec::new();
+        request.overwrite = true;
+        run(
+            &request,
+            &AtomicBool::new(false),
+            |event| progress.push(event),
+            || Ok(()),
+        )
+        .unwrap();
+        let reading: Vec<_> = progress
+            .iter()
+            .filter(|event| event.stage.starts_with("已读取 "))
+            .map(|event| event.fraction.unwrap())
+            .collect();
+        assert_eq!(reading.len(), 3);
+        assert_eq!(reading[0], 0.0);
+        assert!(reading.windows(2).all(|pair| pair[0] < pair[1]));
+        // 目录另有一个未被引用的 OSGB，估算按目录计数，实际读取仍沿场景树。
+        assert_eq!(reading[1], 0.05);
+        assert_eq!(reading[2], 0.10);
+    }
+    let stage = StagedRaster::new(&request).unwrap();
+    let paths = compute_with_storage(
+        &request,
+        &stage.output,
+        stage.path(),
+        &AtomicBool::new(false),
+        |_| {},
+        None,
+        Storage::Disk(stage.path()),
+    )
+    .unwrap();
+    for path in paths {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(stage.path().join(path.file_name().unwrap())).unwrap(),
+        );
     }
 }
 
@@ -276,7 +333,7 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let request = request(temp.path());
     let flag = AtomicBool::new(false);
-    let (summary, mesh, _) = prepare(&request, &flag, &mut |_| {}).unwrap();
+    let (summary, mesh, _) = prepare(&request, &flag, &mut |_| {}, Storage::Memory).unwrap();
     assert_eq!(
         summary.selected,
         [request.input.with_file_name("tile_L9_0.osgb")]
@@ -284,18 +341,11 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     assert_eq!(summary.bounds, [112., 218., 23., 116., 222., 26.]);
     assert_eq!(summary.size, [4, 4]);
     let index = raster::index(&mesh.triangles);
-    let mut textures = TextureCache::new(&mesh.images);
-    let mut render = |rect| {
-        raster::render(
-            &mesh.triangles,
-            &index,
-            &mut textures,
-            &summary,
-            rect,
-            &flag,
-        )
-        .unwrap()
-        .into_planes()
+    let textures = TextureCache::new(&mesh.images);
+    let render = |rect| {
+        raster::render(&mesh.triangles, &index, &textures, &summary, rect, &flag)
+            .unwrap()
+            .into_planes()
     };
     let (z, pixels) = render([0, 0, 4, 4]);
     assert_eq!(z[0], 26.);
@@ -323,7 +373,7 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
         }
     }
     flag.store(true, Ordering::Relaxed);
-    assert!(prepare(&request, &flag, &mut |_| {}).is_err());
+    assert!(prepare(&request, &flag, &mut |_| {}, Storage::Memory).is_err());
 }
 
 #[test]
@@ -358,13 +408,18 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
     let mut progress = Vec::new();
     let files = run(&request, &flag, |event| progress.push(event), || Ok(())).unwrap();
     let fractions: Vec<_> = progress.iter().filter_map(|event| event.fraction).collect();
-    assert_eq!(fractions.first(), Some(&0.20));
+    assert_eq!(fractions.first(), Some(&0.0));
     assert!(progress.iter().any(|event| {
-        event.stage.starts_with("已读取 0 个模型") && event.fraction.is_none()
+        event.stage.starts_with("已读取 0 个模型") && event.fraction == Some(0.0)
     }));
     assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(fractions.iter().all(|&fraction| fraction < 1.0));
-    assert!(progress.iter().any(|event| event.stage == "构建三角形索引"));
+    let index = progress
+        .iter()
+        .position(|event| event.stage == "构建三角形索引")
+        .unwrap();
+    assert_eq!(progress[index].fraction, Some(0.20));
+    assert_eq!(progress[index + 1].fraction, Some(0.50));
     assert!(progress.iter().any(|event| event.stage == "校验写出结果"));
     assert_eq!(files.len(), PRODUCTS.len());
     let original: Vec<_> = files.iter().map(|p| fs::read(p).unwrap()).collect();
@@ -425,6 +480,24 @@ fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
     for (path, bytes) in paths.iter().zip(expected) {
         assert_eq!(fs::read(path)?, bytes);
     }
+    let stage = StagedRaster::new(&request)?;
+    let disk_paths = compute_with_storage(
+        &request,
+        &stage.output,
+        stage.path(),
+        &cancelled,
+        |_| {},
+        Some(&pool),
+        Storage::Disk(stage.path()),
+    )?;
+    assert_eq!(paths, disk_paths);
+    for path in &paths {
+        assert_eq!(
+            fs::read(path)?,
+            fs::read(stage.path().join(path.file_name().unwrap()))?
+        );
+    }
+    stage.publish(true)?;
     request.output = temp.path().join("cancelled");
     let result = run_with_pool(
         &request,
@@ -504,5 +577,63 @@ fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn small_budget_spills_pageable_geometry_and_preflight_stays_page_local() -> Result<()> {
+    const CHILD: &str = "WEBGIS_TEST_OSGB_BUDGET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "dom::tests::small_budget_spills_pageable_geometry_and_preflight_stays_page_local",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return Ok(());
+    }
+    let temp = tempfile::tempdir()?;
+    let request = request(temp.path());
+    let root = request.input.parent().unwrap();
+    let page = fixture_with_faces(root, 1_000);
+    for id in 0..64 {
+        fs::write(root.join(format!("tile_L9_{id}.osgb")), &page)?;
+    }
+    let flag = AtomicBool::new(false);
+    memory::configure(memory::MIB);
+    let summary = preflight_with_progress(&request, &flag, |event| {
+        assert_ne!(event.phase, Phase::SpillGeometry)
+    })?;
+    assert_eq!(summary.selected.len(), 64);
+    assert_eq!(summary.triangles, 128_000);
+    memory::configure(16 * memory::MIB);
+    let stage = StagedRaster::new(&request)?;
+    let mut spilled = false;
+    let products = compute_staged(
+        &request,
+        &stage.output,
+        stage.path(),
+        &flag,
+        |event| {
+            spilled |= event.phase == Phase::SpillGeometry;
+        },
+        None,
+    )?;
+    assert!(spilled);
+    assert_eq!(fs::read_dir(stage.path())?.count(), PRODUCTS.len());
+    stage.publish(false)?;
+    assert!(products.iter().all(|path| path.is_file()));
+
+    memory::configure(128 * 1024);
+    let error = preflight(&request, &flag, |_| {}).err().unwrap();
+    assert!(error.is::<memory::BudgetError>());
+    assert!(error.to_string().contains("tile_L9_0.osgb"));
     Ok(())
 }

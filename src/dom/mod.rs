@@ -1,5 +1,5 @@
-use webgis_core::message;
 use webgis_core::task_pool::{self, ThreadPool};
+use webgis_core::{message, osgb_output::OutputLock};
 pub mod cog;
 mod geotiff;
 pub mod map_tiles;
@@ -11,20 +11,23 @@ mod tile_sampling;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use geotiff::{Affine, Crs};
-use raster::{Mesh, TextureCache};
+#[cfg(test)]
+use raster::TextureCache;
+use raster::{Mesh, Storage};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    io::ErrorKind,
+    io::{BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 use tiff_output::{BigTiff, LevelWriter, NODATA, RasterKind, RasterSpec, TILE};
 use walkdir::WalkDir;
+use webgis_core::osgb_memory as memory;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
@@ -33,7 +36,7 @@ pub enum Mode {
     Local,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -45,7 +48,7 @@ pub struct Request {
     pub overwrite: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Summary {
     pub selected: Vec<PathBuf>,
     pub metadata: Option<PathBuf>,
@@ -68,17 +71,19 @@ struct RunReport<'a> {
     dom_valid_pixels: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Progress {
     pub stage: String,
     pub fraction: Option<f32>,
 }
 
 /// Stable processing stages used by the desktop task log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Prepare,
     ScanModels,
     ReadModel,
+    SpillGeometry,
     IndexTriangles,
     Rasterize,
     BuildOverviews,
@@ -101,20 +106,28 @@ pub enum Phase {
 }
 
 /// Progress with a stage identifier independent of its localized display text.
+#[derive(Serialize, Deserialize)]
 pub struct TaskProgress {
     pub phase: Phase,
     pub display: Progress,
+    pub concurrency: Option<usize>,
 }
 
 impl TaskProgress {
     pub fn new(phase: Phase, stage: impl Into<String>, fraction: Option<f32>) -> Self {
         Self {
             phase,
+            concurrency: None,
             display: Progress {
                 stage: stage.into(),
                 fraction,
             },
         }
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency);
+        self
     }
 }
 
@@ -264,6 +277,7 @@ fn prepare(
     request: &Request,
     cancelled: &AtomicBool,
     progress: &mut impl FnMut(TaskProgress),
+    storage: Storage<'_>,
 ) -> Result<(Summary, Mesh, Option<Crs>)> {
     ensure!(
         request.resolution.is_finite() && request.resolution > 0.,
@@ -350,7 +364,7 @@ fn prepare(
             };
             message!(invalid_crs_in, source.display())
         })?;
-    let (mesh, selected) = Mesh::load(root, selected, origin, cancelled, progress)?;
+    let (mesh, selected) = Mesh::load(root, selected, origin, cancelled, progress, storage)?;
     let bounds = mesh.bounds;
     let [min_x, min_y, _, max_x, max_y, _] = bounds;
     ensure!(
@@ -376,7 +390,7 @@ fn prepare(
         bounds,
         size: size.map(|v| v as i32),
         resolution: request.resolution,
-        triangles: mesh.triangles.len(),
+        triangles: mesh.count,
     };
     Ok((summary, mesh, epsg))
 }
@@ -394,7 +408,7 @@ pub fn preflight_with_progress(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(TaskProgress),
 ) -> Result<Summary> {
-    let (summary, _, _) = prepare(request, cancelled, &mut progress)?;
+    let (summary, _, _) = prepare(request, cancelled, &mut progress, Storage::Preview)?;
     check_cancelled(cancelled)?;
     Ok(summary)
 }
@@ -431,29 +445,95 @@ pub fn run_with_progress(
     before_publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<PathBuf>> {
-    // 模型读取占总进度的前 20%，预检仍使用自身的读取进度。
-    let (summary, mesh, crs) = prepare(request, cancelled, &mut |mut event| {
-        event.display.fraction = event.display.fraction.map(|fraction| fraction * 0.20);
-        progress(event);
-    })?;
+    let staging = StagedRaster::new(request)?;
+    let products = compute_staged(
+        request,
+        &staging.output,
+        staging.path(),
+        cancelled,
+        &mut progress,
+        pool,
+    )?;
     check_cancelled(cancelled)?;
-    fs::create_dir_all(&request.output)
-        .with_context(|| message!(create_folder, request.output.display()))?;
-    let output = request
-        .output
-        .canonicalize()
-        .with_context(|| message!(could_not_resolve_output_path, request.output.display()))?;
-    let lock =
-        fs::File::open(&output).with_context(|| message!(could_not_open, output.display()))?;
-    use rustix::fs::{FlockOperation, flock};
-    flock(&lock, FlockOperation::NonBlockingLockExclusive)
-        .context(message!(output_folder_lock_failed))?;
-    check_conflicts(&output, request.overwrite)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".osgb-raster-")
-        .tempdir_in(&output)
-        .with_context(|| message!(create_temporary_folder_in, output.display()))?;
-    let stage = staging.path();
+    before_publish()?;
+    staging.publish(request.overwrite)?;
+    Ok(products)
+}
+
+pub struct StagedRaster {
+    pub output: PathBuf,
+    staging: tempfile::TempDir,
+    _lock: OutputLock,
+}
+
+impl StagedRaster {
+    pub fn new(request: &Request) -> Result<Self> {
+        fs::create_dir_all(&request.output)
+            .with_context(|| message!(create_folder, request.output.display()))?;
+        let output = request
+            .output
+            .canonicalize()
+            .with_context(|| message!(could_not_resolve_output_path, request.output.display()))?;
+        let lock = OutputLock::acquire(&output).context(message!(output_folder_lock_failed))?;
+        check_conflicts(&output, request.overwrite)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".osgb-raster-")
+            .tempdir_in(&output)
+            .with_context(|| message!(create_temporary_folder_in, output.display()))?;
+        Ok(Self {
+            output,
+            staging,
+            _lock: lock,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.staging.path()
+    }
+
+    pub fn publish(self, overwrite: bool) -> Result<()> {
+        publish(self.path(), &self.output, overwrite)
+    }
+}
+
+pub fn compute_staged(
+    request: &Request,
+    output: &Path,
+    stage: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(TaskProgress),
+    pool: Option<&ThreadPool>,
+) -> Result<Vec<PathBuf>> {
+    compute_with_storage(
+        request,
+        output,
+        stage,
+        cancelled,
+        &mut progress,
+        pool,
+        Storage::Auto(stage),
+    )
+}
+
+fn compute_with_storage(
+    request: &Request,
+    output: &Path,
+    stage: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(TaskProgress),
+    pool: Option<&ThreadPool>,
+    storage: Storage<'_>,
+) -> Result<Vec<PathBuf>> {
+    let (summary, mut mesh, crs) = prepare(
+        request,
+        cancelled,
+        &mut |mut event| {
+            event.display.fraction = event.display.fraction.map(|fraction| fraction * 0.20);
+            progress(event);
+        },
+        storage,
+    )?;
+    check_cancelled(cancelled)?;
     let [width, height] = summary.size;
     let [west, _, _, _, north, _] = summary.bounds;
     let res = summary.resolution;
@@ -462,23 +542,49 @@ pub fn run_with_progress(
         transform: Affine([west, res, 0., north, 0., -res]),
         crs,
     };
+    let (w, h) = (width as usize, height as usize);
+    let count = w.div_ceil(TILE) as u64 * h.div_ceil(TILE) as u64;
+    // Per-tile offsets, byte counts and coverage entries across all output
+    // levels, including in-memory copies created by IFD writes and validation.
+    let metadata_bytes = usize::try_from(count)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(256);
+    let output_bytes = metadata_bytes.saturating_add(8 * memory::MIB);
+    let base_block = TILE * TILE * 24;
+    let candidate_bytes = mesh.count.saturating_mul(2 * size_of::<usize>());
+    if matches!(storage, Storage::Auto(_))
+        && !mesh.is_on_disk()
+        && output_bytes
+            .saturating_add(base_block)
+            .saturating_add(candidate_bytes)
+            .saturating_add(mesh.texture_peak)
+            > memory::available_budget()
+    {
+        mesh.spill(stage, cancelled, &mut progress)?;
+    }
+    let _output = memory::reserve(output_bytes, message!(osgb_raster_buffers))?;
+    let block_bytes = base_block.saturating_add(if mesh.is_on_disk() {
+        raster::DISK_QUERY_BYTES
+    } else {
+        candidate_bytes
+    });
     let dsm_path = stage.join(PRODUCTS[0]);
     let dom_path = stage.join(PRODUCTS[1]);
     let mut dsm_file = BigTiff::new_big(fs::File::create(&dsm_path)?)?;
     let mut dom_file = BigTiff::new_big(fs::File::create(&dom_path)?)?;
     let mut dsm = LevelWriter::new(&mut dsm_file, RasterKind::Dsm)?;
     let mut dom = LevelWriter::new(&mut dom_file, RasterKind::Dom)?;
-    progress(TaskProgress::new(
-        Phase::IndexTriangles,
-        message!(build_triangle_index),
-        Some(0.20),
-    ));
-    let index = raster::index(&mesh.triangles);
-    let mut textures: Vec<_> = (0..task_pool::width(pool))
-        .map(|_| TextureCache::new(&mesh.images))
-        .collect();
-    let (w, h) = (width as usize, height as usize);
-    let count = w.div_ceil(TILE) as u64 * h.div_ceil(TILE) as u64;
+    let index = if mesh.is_on_disk() {
+        None
+    } else {
+        progress(TaskProgress::new(
+            Phase::IndexTriangles,
+            message!(build_triangle_index),
+            Some(0.20),
+        ));
+        Some(raster::index(&mesh.triangles))
+    };
+    let textures = mesh.textures();
     progress(TaskProgress::new(
         Phase::Rasterize,
         message!(rasterize_0_count_blocks, count = count),
@@ -487,15 +593,44 @@ pub fn run_with_progress(
     let mut done = 0_u64;
     let mut dsm_valid_pixels = 0_u64;
     let mut dom_valid_pixels = 0_u64;
-    let positions = (0..h)
+    let mut positions = (0..h)
         .step_by(TILE)
-        .flat_map(|y| (0..w).step_by(TILE).map(move |x| (x, y)));
-    for batch in task_pool::batches(positions, pool) {
-        let blocks = task_pool::map_with(pool, batch, &mut textures, |(x, y), textures| {
+        .flat_map(|y| (0..w).step_by(TILE).map(move |x| (x, y)))
+        .peekable();
+    let mut last_width = None;
+    while positions.peek().is_some() {
+        if memory::pressure()
+            || memory::available_budget() < block_bytes.saturating_add(mesh.texture_peak)
+        {
+            textures.trim_idle();
+        }
+        if memory::pressure() {
+            mesh.reclaim_disk_cache();
+        }
+        tiff_output::wait_for_memory(cancelled, &[&dsm_path, &dom_path])?;
+        let width = memory::width(task_pool::width(pool)).min(
+            (memory::available_budget().saturating_sub(mesh.texture_peak) / block_bytes).max(1),
+        );
+        let batch: Vec<_> = positions.by_ref().take(width).collect();
+        if last_width != Some(batch.len()) {
+            last_width = Some(batch.len());
+            progress(
+                TaskProgress::new(
+                    Phase::Rasterize,
+                    message!(rasterize_done_count_blocks, done = done, count = count),
+                    Some(0.50 + 0.30 * (done as f32 / count as f32)),
+                )
+                .with_concurrency(batch.len()),
+            );
+        }
+        let _blocks = memory::reserve(
+            block_bytes.saturating_mul(batch.len()),
+            message!(osgb_raster_buffers),
+        )?;
+        let blocks = task_pool::map(pool, batch, |(x, y)| {
             check_cancelled(cancelled)?;
             let rect = [x, y, TILE.min(w - x), TILE.min(h - y)];
-            let block =
-                raster::render(&mesh.triangles, &index, textures, &summary, rect, cancelled)?;
+            let block = mesh.render(index.as_ref(), &textures, &summary, rect, cancelled)?;
             Ok::<_, anyhow::Error>(([rect[2], rect[3]], block))
         })?;
         for (size, block) in blocks {
@@ -513,6 +648,9 @@ pub fn run_with_progress(
             ));
         }
     }
+    drop(textures);
+    drop(index);
+    mesh.finish()?;
     ensure!(
         dsm_valid_pixels > 0,
         message!(no_pixel_centers_fall_on_the_model_surface_reduce_the_pixel_size)
@@ -573,14 +711,14 @@ pub fn run_with_progress(
         dsm_valid_pixels,
         dom_valid_pixels,
     };
-    fs::write(stage.join(PRODUCTS[2]), serde_json::to_vec_pretty(&report)?)?;
+    let mut report_file = BufWriter::new(fs::File::create(stage.join(PRODUCTS[2]))?);
+    serde_json::to_writer_pretty(&mut report_file, &report)?;
+    report_file.flush()?;
     ensure!(
         fs::read_dir(stage)?.count() == PRODUCTS.len(),
         message!(output_contains_unexpected_geotiff_sidecar_files)
     );
     check_cancelled(cancelled)?;
-    before_publish()?;
-    publish(stage, &output, request.overwrite)?;
     Ok(products)
 }
 
