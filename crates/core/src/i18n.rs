@@ -81,6 +81,42 @@ macro_rules! localized_template {
 
 #[macro_export]
 macro_rules! message {
+    (osgb_raster_geometry) => {
+        $crate::localized_template!("OSGB 页几何", "OSGB page geometry", "OSGB ページのジオメトリ")
+    };
+    (osgb_clip_page) => {
+        $crate::localized_template!("OSGB 页裁剪", "OSGB page clipping", "OSGB ページの切り抜き")
+    };
+    (osgb_raster_buffers) => {
+        $crate::localized_template!("栅格块和 TIFF 控制结构", "Raster blocks and TIFF control structures", "ラスターブロックと TIFF 管理構造")
+    };
+    (osgb_disk_index) => {
+        $crate::localized_template!("几何和索引转为磁盘存储", "Spill geometry and index to disk", "ジオメトリとインデックスをディスクに保存")
+    };
+    (osgb_disk_full) => {
+        $crate::localized_template!("OSGB 暂存文件系统空间不足。", "Insufficient space on the OSGB staging filesystem.", "OSGB の一時ファイル用ファイルシステムの空き容量が不足しています。")
+    };
+    (osgb_memory_pressure) => {
+        $crate::localized_template!("系统内存持续不足，已停止 OSGB 任务。", "OSGB task stopped because available system memory stayed too low.", "システムの空きメモリ不足が続いたため、OSGB タスクを停止しました。")
+    };
+    (osgb_pressure_serial, $rss:expr, budget = $budget:expr) => {
+        $crate::localized_template!("系统内存不足，暂停新增工作并将后续并发降为 1。峰值 RSS {} 字节，内存预算 {} 字节。", "System memory is low. Pausing new work and lowering concurrency to one. Peak RSS {} bytes, memory budget {} bytes.", "システムメモリが不足しています。新規処理を一時停止し、並列数を 1 に下げます。ピーク RSS {} バイト、メモリ予算 {} バイト。"; $rss, $budget)
+    };
+    (osgb_rss_limit) => {
+        $crate::localized_template!("OSGB 工作进程超出内存预算，已停止任务。", "The OSGB worker exceeded its memory budget and was stopped.", "OSGB ワーカーがメモリ予算を超えたため停止しました。")
+    };
+    (osgb_worker_usage, $rss:expr, budget = $budget:expr) => {
+        $crate::localized_template!("工作进程峰值 RSS {} 字节，内存预算 {} 字节。", "Worker peak RSS {} bytes, memory budget {} bytes.", "ワーカーのピーク RSS {} バイト、メモリ予算 {} バイト。"; $rss, $budget)
+    };
+    (osgb_worker_metrics, $rss:expr, budget = $budget:expr, ms = $ms:expr, staged = $staged:expr) => {
+        $crate::localized_template!("工作进程峰值 RSS {} 字节，内存预算 {} 字节，已用时 {} 毫秒，暂存文件 {} 字节。", "Worker peak RSS {} bytes, budget {} bytes, elapsed {} ms, staging files {} bytes.", "ワーカーのピーク RSS {} バイト、メモリ予算 {} バイト、経過時間 {} ミリ秒、一時ファイル {} バイト。"; $rss, $budget, $ms, $staged)
+    };
+    (osgb_worker_parallelism, $width:expr) => {
+        $crate::localized_template!("本批次并发数 {}。", "Current batch concurrency {}.", "現在のバッチの並列数は {} です。"; $width)
+    };
+    (osgb_reservation_failed, $unit:expr, bytes = $bytes:expr, available = $available:expr) => {
+        $crate::localized_template!("{} 需要 {} 字节内存，剩余任务预算为 {} 字节。", "{} requires {} bytes of memory, with {} bytes left in the task budget.", "{} に {} バイトが必要ですが、残りのメモリ予算は {} バイトです。"; $unit, $bytes, $available)
+    };
     (webgis_toolbox) => {
         $crate::localized_template!("WebGIS 工具箱", "WebGIS Toolbox", "WebGIS ツールボックス")
     };
