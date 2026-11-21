@@ -207,6 +207,9 @@ macro_rules! message {
     (about) => {
         $crate::localized_template!("关于", "About", "このアプリについて")
     };
+    (version) => {
+        $crate::localized_template!("版本号", "Version", "バージョン")
+    };
     (author) => {
         $crate::localized_template!("作者", "Author", "作者")
     };

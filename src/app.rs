@@ -290,6 +290,10 @@ impl App {
                     ui.heading(message!(about));
                     ui.add_space(8.);
                     egui::Grid::new("about_project").show(ui, |ui| {
+                        ui.label(message!(version));
+                        ui.label(env!("CARGO_PKG_VERSION"));
+                        ui.end_row();
+
                         ui.label(message!(author));
                         ui.label(env!("CARGO_PKG_AUTHORS"));
                         ui.end_row();
