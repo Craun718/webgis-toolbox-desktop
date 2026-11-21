@@ -504,6 +504,10 @@ pub fn compute_staged(
     mut progress: impl FnMut(TaskProgress),
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<PathBuf>> {
+    let storage = match std::env::var("WEBGIS_INTERNAL_OSGB_GEOMETRY").as_deref() {
+        Ok("blocks") => Storage::Chunked(stage),
+        _ => Storage::Auto(stage),
+    };
     compute_with_storage(
         request,
         output,
@@ -511,7 +515,7 @@ pub fn compute_staged(
         cancelled,
         &mut progress,
         pool,
-        Storage::Auto(stage),
+        storage,
     )
 }
 
@@ -552,7 +556,7 @@ fn compute_with_storage(
     let output_bytes = metadata_bytes.saturating_add(8 * memory::MIB);
     let base_block = TILE * TILE * 24;
     let candidate_bytes = mesh.count.saturating_mul(2 * size_of::<usize>());
-    if matches!(storage, Storage::Auto(_))
+    if storage.automatic_stage().is_some()
         && !mesh.is_on_disk()
         && output_bytes
             .saturating_add(base_block)
@@ -562,12 +566,9 @@ fn compute_with_storage(
     {
         mesh.spill(stage, cancelled, &mut progress)?;
     }
+    mesh.seal_disk();
     let _output = memory::reserve(output_bytes, message!(osgb_raster_buffers))?;
-    let block_bytes = base_block.saturating_add(if mesh.is_on_disk() {
-        raster::DISK_QUERY_BYTES
-    } else {
-        candidate_bytes
-    });
+    let block_bytes = base_block.saturating_add(mesh.disk_query_bytes().unwrap_or(candidate_bytes));
     let dsm_path = stage.join(PRODUCTS[0]);
     let dom_path = stage.join(PRODUCTS[1]);
     let mut dsm_file = BigTiff::new_big(fs::File::create(&dsm_path)?)?;

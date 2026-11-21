@@ -36,6 +36,9 @@ pub struct Mesh {
     pub texture_peak: usize,
     disk: Option<DiskMesh>,
     geometry: Vec<Reservation>,
+    pending_pages: Vec<usize>,
+    pending_bytes: usize,
+    chunked: bool,
 }
 
 pub(super) use osgb::RasterTriangle as Triangle;
@@ -56,10 +59,35 @@ enum Source {
 pub enum Storage<'a> {
     Preview,
     Auto(&'a Path),
+    Chunked(&'a Path),
+    #[cfg(test)]
+    ChunkedDisk(&'a Path),
     #[cfg(test)]
     Disk(&'a Path),
     #[cfg(test)]
     Memory,
+}
+
+impl<'a> Storage<'a> {
+    pub fn automatic_stage(self) -> Option<&'a Path> {
+        match self {
+            Self::Auto(stage) | Self::Chunked(stage) => Some(stage),
+            _ => None,
+        }
+    }
+
+    fn chunked(self) -> bool {
+        match self {
+            Self::Chunked(_) => true,
+            #[cfg(test)]
+            Self::ChunkedDisk(_) => true,
+            _ => false,
+        }
+    }
+}
+
+fn pending_geometry_limit(budget: usize) -> usize {
+    (8 * memory::MIB).min(budget / 8)
 }
 
 impl Mesh {
@@ -88,9 +116,12 @@ impl Mesh {
             texture_peak: 0,
             disk: None,
             geometry: Vec::new(),
+            pending_pages: Vec::new(),
+            pending_bytes: 0,
+            chunked: storage.chunked(),
         };
         #[cfg(test)]
-        if let Storage::Disk(stage) = storage {
+        if let Storage::Disk(stage) | Storage::ChunkedDisk(stage) = storage {
             mesh.spill(stage, cancelled, progress)?;
         }
         let mut unread = files.len();
@@ -128,9 +159,19 @@ impl Mesh {
             let estimated_total = known_total.max(directory_count.unwrap_or(0));
             let estimate = read_count as f32 / estimated_total as f32;
             read_fraction = read_fraction.max(estimate.min(0.95));
+            let stage_message = if mesh.chunked {
+                let (blocks, bytes) = mesh
+                    .disk
+                    .as_ref()
+                    .and_then(DiskMesh::block_stats)
+                    .unwrap_or_default();
+                message!(osgb_block_progress, read_count, blocks, bytes)
+            } else {
+                message!(read_model, read_count, file.display())
+            };
             progress(TaskProgress::new(
                 Phase::ReadModel,
-                message!(read_model, read_count, file.display()),
+                stage_message,
                 Some(read_fraction),
             ));
             let context = || message!(could_not_read, file.display());
@@ -139,7 +180,7 @@ impl Mesh {
             }
             memory::wait(cancelled).map_err(anyhow::Error::msg)?;
             let estimate = memory::page_bytes(&file).with_context(context)?;
-            if let Storage::Auto(stage) = storage
+            if let Some(stage) = storage.automatic_stage()
                 && mesh.disk.is_none()
                 && !mesh.triangles.is_empty()
                 && estimate > memory::available_budget()
@@ -150,11 +191,11 @@ impl Mesh {
             let bytes = memory::read_page(&file).with_context(context)?;
             let mut scene = match osgb::raster_mesh(&bytes, cancelled) {
                 Err(osgb::RasterError::Budget(_))
-                    if matches!(storage, Storage::Auto(_))
+                    if storage.automatic_stage().is_some()
                         && mesh.disk.is_none()
                         && !mesh.triangles.is_empty() =>
                 {
-                    if let Storage::Auto(stage) = storage {
+                    if let Some(stage) = storage.automatic_stage() {
                         mesh.spill(stage, cancelled, progress)?;
                     }
                     osgb::raster_mesh(&bytes, cancelled)
@@ -250,7 +291,7 @@ impl Mesh {
                 };
                 let decoded = match validate() {
                     Err(error) if error.is::<memory::BudgetError>() => {
-                        if let Storage::Auto(stage) = storage
+                        if let Some(stage) = storage.automatic_stage()
                             && mesh.disk.is_none()
                             && !mesh.triangles.is_empty()
                         {
@@ -308,10 +349,13 @@ impl Mesh {
                 let retained = page_geometry
                     .saturating_add(scene.triangles.capacity().saturating_mul(144))
                     .saturating_add(images.iter().map(Texture::descriptor_bytes).sum());
-                if let Storage::Auto(stage) = storage
+                if let Some(stage) = storage.automatic_stage()
                     && mesh.disk.is_none()
-                    && retained.saturating_sub(page_geometry)
+                    && (retained.saturating_sub(page_geometry)
                         > memory::available_budget().saturating_sub(memory::limit() / 4)
+                        || (mesh.chunked
+                            && mesh.pending_bytes.saturating_add(retained)
+                                > pending_geometry_limit(memory::limit())))
                 {
                     mesh.spill(stage, cancelled, progress)?;
                 }
@@ -325,6 +369,7 @@ impl Mesh {
                         triangle_start,
                         image_start,
                         cancelled,
+                        None,
                     )?;
                 } else {
                     let mut triangles = std::mem::take(&mut scene.triangles);
@@ -332,6 +377,10 @@ impl Mesh {
                     mesh.geometry
                         .push(memory::reserve(retained, file.display())?);
                     mesh.external.extend(external);
+                    if mesh.chunked {
+                        mesh.pending_pages.push(triangles.len());
+                        mesh.pending_bytes += retained;
+                    }
                     mesh.triangles.append(&mut triangles);
                     mesh.images.append(&mut images);
                 }
@@ -341,6 +390,18 @@ impl Mesh {
             mesh.count != 0,
             message!(the_selected_model_contains_no_triangles)
         );
+        if mesh.chunked {
+            let (blocks, bytes) = mesh
+                .disk
+                .as_ref()
+                .and_then(DiskMesh::block_stats)
+                .unwrap_or_default();
+            progress(TaskProgress::new(
+                Phase::ReadModel,
+                message!(osgb_block_progress, read_count, blocks, bytes),
+                Some(1.0),
+            ));
+        }
         Ok((mesh, selected))
     }
 
@@ -358,8 +419,34 @@ impl Mesh {
         if self.disk.is_some() {
             return Ok(());
         }
-        let mut disk = DiskMesh::new(stage)?;
-        disk.insert(&self.triangles, &self.images, 0, 0, cancelled)?;
+        let mut disk = DiskMesh::new(stage, self.chunked)?;
+        if self.chunked {
+            disk.insert(&[], &self.images, 0, 0, cancelled, None)?;
+            let mut first = 0;
+            for count in self.pending_pages.drain(..) {
+                let end = first + count;
+                disk.insert(&self.triangles[first..end], &[], first, 0, cancelled, None)?;
+                first = end;
+            }
+            self.pending_pages = Vec::new();
+            self.pending_bytes = 0;
+        } else {
+            let total = self.triangles.len();
+            disk.insert(
+                &self.triangles,
+                &self.images,
+                0,
+                0,
+                cancelled,
+                Some(&mut |done| {
+                    progress(TaskProgress::new(
+                        Phase::SpillGeometry,
+                        message!(osgb_disk_index_progress, done, total),
+                        None,
+                    ));
+                }),
+            )?;
+        }
         self.triangles = Vec::new();
         self.images = Vec::new();
         self.external = HashMap::new();
@@ -378,6 +465,16 @@ impl Mesh {
         self.disk.is_some()
     }
 
+    pub fn seal_disk(&mut self) {
+        if let Some(disk) = &mut self.disk {
+            disk.seal();
+        }
+    }
+
+    pub fn disk_query_bytes(&self) -> Option<usize> {
+        self.disk.as_ref().map(DiskMesh::query_bytes)
+    }
+
     pub fn textures(&self) -> TextureCache<'_> {
         TextureCache::with_disk(&self.images, self.disk.as_ref())
     }
@@ -392,7 +489,7 @@ impl Mesh {
     ) -> Result<Block> {
         if let Some(disk) = &self.disk {
             render_candidates(textures, summary, rect, cancelled, |bounds, visit| {
-                disk.visit(bounds, visit)
+                disk.visit(bounds, cancelled, visit)
             })
         } else {
             render(

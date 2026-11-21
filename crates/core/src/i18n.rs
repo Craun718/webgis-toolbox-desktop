@@ -90,6 +90,12 @@ macro_rules! message {
     (osgb_raster_buffers) => {
         $crate::localized_template!("栅格块和 TIFF 控制结构", "Raster blocks and TIFF control structures", "ラスターブロックと TIFF 管理構造")
     };
+    (osgb_block_progress, $pages:expr, $blocks:expr, $bytes:expr) => {
+        $crate::localized_template!("已读取 {} 页，已写入 {} 个几何块，暂存 {} 字节", "Read {} pages, wrote {} geometry blocks, {} staging bytes", "{} ページ読み込み、{} ジオメトリブロック書き込み、一時領域 {} バイト"; $pages, $blocks, $bytes)
+    };
+    (osgb_disk_index_progress, $done:expr, $total:expr) => {
+        $crate::localized_template!("正在迁移几何和索引，已写入 {} / {} 个三角形", "Migrating geometry and index: {} / {} triangles written", "ジオメトリとインデックスを移行中：{} / {} 三角形を書き込み済み"; $done, $total)
+    };
     (osgb_disk_index) => {
         $crate::localized_template!("几何和索引转为磁盘存储", "Spill geometry and index to disk", "ジオメトリとインデックスをディスクに保存")
     };

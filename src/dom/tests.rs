@@ -111,6 +111,10 @@ fn fixture(input: &Path) -> Vec<u8> {
 }
 
 fn fixture_with_faces(input: &Path, faces: u32) -> Vec<u8> {
+    textured_fixture(input, faces, [1., 4.])
+}
+
+fn textured_fixture(input: &Path, faces: u32, heights: [f32; 2]) -> Vec<u8> {
     let mut png = Cursor::new(Vec::new());
     RgbaImage::from_fn(1, 2, |_, row| {
         if row == 0 {
@@ -124,10 +128,10 @@ fn fixture_with_faces(input: &Path, faces: u32) -> Vec<u8> {
     RgbImage::from_pixel(1, 1, Rgb([0, 240, 0]))
         .save(input.join("lower.jpg"))
         .unwrap();
-    let mut children = geometry_with_faces(10, 1., Texture::File("lower.jpg"), faces);
+    let mut children = geometry_with_faces(10, heights[0], Texture::File("lower.jpg"), faces);
     children.extend(geometry_with_faces(
         20,
-        4.,
+        heights[1],
         Texture::Inline(png.get_ref()),
         faces,
     ));
@@ -310,21 +314,26 @@ fn follows_mixed_lod_pages_and_discards_embedded_coarse_geometry() {
         assert_eq!(reading[2], 0.10);
     }
     let stage = StagedRaster::new(&request).unwrap();
-    let paths = compute_with_storage(
-        &request,
-        &stage.output,
-        stage.path(),
-        &AtomicBool::new(false),
-        |_| {},
-        None,
+    for storage in [
         Storage::Disk(stage.path()),
-    )
-    .unwrap();
-    for path in paths {
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            fs::read(stage.path().join(path.file_name().unwrap())).unwrap(),
-        );
+        Storage::ChunkedDisk(stage.path()),
+    ] {
+        let paths = compute_with_storage(
+            &request,
+            &stage.output,
+            stage.path(),
+            &AtomicBool::new(false),
+            |_| {},
+            None,
+            storage,
+        )
+        .unwrap();
+        for path in paths {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                fs::read(stage.path().join(path.file_name().unwrap())).unwrap(),
+            );
+        }
     }
 }
 
@@ -333,7 +342,9 @@ fn renders_highest_surface_texture_and_mask_consistently_across_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let request = request(temp.path());
     let flag = AtomicBool::new(false);
-    let (summary, mesh, _) = prepare(&request, &flag, &mut |_| {}, Storage::Memory).unwrap();
+    let (summary, mesh, _) =
+        prepare(&request, &flag, &mut |_| {}, Storage::Chunked(temp.path())).unwrap();
+    assert!(!mesh.is_on_disk());
     assert_eq!(
         summary.selected,
         [request.input.with_file_name("tile_L9_0.osgb")]
@@ -459,6 +470,42 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
 }
 
 #[test]
+fn chunked_and_sqlite_match_for_equal_height_textures_across_geometry_blocks() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut request = request(temp.path());
+    request.input = request.input.with_file_name("tile_L9_0.osgb");
+    let model = textured_fixture(request.input.parent().unwrap(), 33_000, [4., 4.]);
+    fs::write(&request.input, model)?;
+    let flag = AtomicBool::new(false);
+    let stage = StagedRaster::new(&request)?;
+    let paths = compute_with_storage(
+        &request,
+        &stage.output,
+        stage.path(),
+        &flag,
+        |_| {},
+        None,
+        Storage::Disk(stage.path()),
+    )?;
+    stage.publish(false)?;
+    request.overwrite = true;
+    let stage = StagedRaster::new(&request)?;
+    compute_with_storage(
+        &request,
+        &stage.output,
+        stage.path(),
+        &flag,
+        |_| {},
+        None,
+        Storage::ChunkedDisk(stage.path()),
+    )?;
+    for (path, name) in paths.iter().zip(PRODUCTS) {
+        assert_eq!(fs::read(path)?, fs::read(stage.path().join(name))?);
+    }
+    Ok(())
+}
+
+#[test]
 fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
     use tiff::{
         decoder::{Decoder, DecodingResult},
@@ -481,21 +528,26 @@ fn local_bigtiff_preserves_pixels_and_overviews_across_tiles() -> Result<()> {
         assert_eq!(fs::read(path)?, bytes);
     }
     let stage = StagedRaster::new(&request)?;
-    let disk_paths = compute_with_storage(
-        &request,
-        &stage.output,
-        stage.path(),
-        &cancelled,
-        |_| {},
-        Some(&pool),
+    for storage in [
         Storage::Disk(stage.path()),
-    )?;
-    assert_eq!(paths, disk_paths);
-    for path in &paths {
-        assert_eq!(
-            fs::read(path)?,
-            fs::read(stage.path().join(path.file_name().unwrap()))?
-        );
+        Storage::ChunkedDisk(stage.path()),
+    ] {
+        let disk_paths = compute_with_storage(
+            &request,
+            &stage.output,
+            stage.path(),
+            &cancelled,
+            |_| {},
+            Some(&pool),
+            storage,
+        )?;
+        assert_eq!(paths, disk_paths);
+        for path in &paths {
+            assert_eq!(
+                fs::read(path)?,
+                fs::read(stage.path().join(path.file_name().unwrap()))?
+            );
+        }
     }
     stage.publish(true)?;
     request.output = temp.path().join("cancelled");
@@ -616,20 +668,65 @@ fn small_budget_spills_pageable_geometry_and_preflight_stays_page_local() -> Res
     memory::configure(16 * memory::MIB);
     let stage = StagedRaster::new(&request)?;
     let mut spilled = false;
-    let products = compute_staged(
+    let products = compute_with_storage(
         &request,
         &stage.output,
         stage.path(),
         &flag,
         |event| {
-            spilled |= event.phase == Phase::SpillGeometry;
+            spilled |=
+                event.phase == Phase::SpillGeometry && event.display.stage.contains("个三角形");
         },
         None,
+        Storage::Auto(stage.path()),
     )?;
     assert!(spilled);
     assert_eq!(fs::read_dir(stage.path())?.count(), PRODUCTS.len());
     stage.publish(false)?;
     assert!(products.iter().all(|path| path.is_file()));
+
+    let mut request = request;
+    request.overwrite = true;
+    let original: Vec<_> = products
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<_>>()?;
+    for abort in [false, true] {
+        let stage = StagedRaster::new(&request)?;
+        let mut wrote_blocks = false;
+        let result = compute_with_storage(
+            &request,
+            &stage.output,
+            stage.path(),
+            &flag,
+            |event| {
+                if event.phase == Phase::ReadModel && stage.path().join("mesh.blocks").is_file() {
+                    wrote_blocks = true;
+                    assert!(event.display.stage.contains("个几何块"));
+                    if abort {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+            None,
+            Storage::Chunked(stage.path()),
+        );
+        assert!(wrote_blocks);
+        if abort {
+            assert!(format!("{:#}", result.unwrap_err()).contains("已取消"));
+            flag.store(false, Ordering::Relaxed);
+        } else {
+            assert_eq!(result?, products);
+            for (name, bytes) in PRODUCTS.iter().zip(&original) {
+                assert_eq!(fs::read(stage.path().join(name))?, *bytes);
+            }
+        }
+        drop(stage);
+        assert_eq!(fs::read_dir(&request.output)?.count(), PRODUCTS.len());
+        for (path, bytes) in products.iter().zip(&original) {
+            assert_eq!(fs::read(path)?, *bytes);
+        }
+    }
 
     memory::configure(128 * 1024);
     let error = preflight(&request, &flag, |_| {}).err().unwrap();
