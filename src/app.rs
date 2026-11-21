@@ -208,6 +208,8 @@ impl App {
     }
 }
 
+const TASK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &EguiContext, _: &mut eframe::Frame) {
         let language = self.settings.language();
@@ -232,7 +234,7 @@ impl App {
         self.poll();
         let busy = self.worker.is_some();
         if busy {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            ctx.request_repaint_after(TASK_REFRESH_INTERVAL);
         }
         if busy && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

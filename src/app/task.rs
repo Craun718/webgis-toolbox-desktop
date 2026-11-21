@@ -115,17 +115,17 @@ struct TaskControl {
 }
 
 pub(super) struct TaskContext {
-    egui: egui::Context,
     pub(super) cancelled: Arc<AtomicBool>,
     control: Arc<TaskControl>,
 }
 
 impl TaskContext {
     pub(super) fn update(&self, event: TaskProgress) {
-        let mut state = self.control.state.lock().unwrap();
-        state.update(event, Instant::now());
-        drop(state);
-        self.egui.request_repaint_of(egui::ViewportId::ROOT);
+        self.control
+            .state
+            .lock()
+            .unwrap()
+            .update(event, Instant::now());
     }
 
     pub(super) fn log(&self, message: &str) {
@@ -134,7 +134,6 @@ impl TaskContext {
             .lock()
             .unwrap()
             .log(console::Level::Info, message);
-        self.egui.request_repaint_of(egui::ViewportId::ROOT);
     }
 
     pub(super) fn publish(&self) -> Result<()> {
@@ -154,8 +153,6 @@ impl TaskContext {
             publishing: true,
         };
         state.log(console::Level::Info, message!(save_results));
-        drop(state);
-        self.egui.request_repaint_of(egui::ViewportId::ROOT);
         Ok(())
     }
 }
@@ -180,8 +177,8 @@ impl Worker {
             cancelled: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(TaskState::new(name)),
         });
+        let egui = egui.clone();
         let task = TaskContext {
-            egui: egui.clone(),
             cancelled: control.cancelled.clone(),
             control: control.clone(),
         };
@@ -199,7 +196,7 @@ impl Worker {
                     state.finish(&result);
                     drop(state);
                     let _ = sender.send(result);
-                    task.egui.request_repaint_of(egui::ViewportId::ROOT);
+                    egui.request_repaint_of(egui::ViewportId::ROOT);
                 })
             })
             .context(message!(could_not_start_the_background_worker))?;
@@ -210,6 +207,7 @@ impl Worker {
         TaskWindow {
             control: self.control.clone(),
             id: egui::ViewportId::from_hash_of(("task-window", sequence)),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -250,44 +248,63 @@ impl Worker {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct TaskWindow {
     control: Arc<TaskControl>,
     id: egui::ViewportId,
+    closed: Arc<AtomicBool>,
 }
 
 impl TaskWindow {
     pub(super) fn show(&self, ctx: &egui::Context, busy: bool) -> bool {
+        if self.closed.load(Ordering::Relaxed) {
+            return true;
+        }
+
         let title = self.control.state.lock().unwrap().name.clone();
-        ctx.show_viewport_immediate(
+        let window = self.clone();
+        ctx.show_viewport_deferred(
             self.id,
             egui::ViewportBuilder::default()
                 .with_title(title.clone())
                 .with_inner_size([720., 410.])
                 .with_min_inner_size([360., 220.])
                 .with_resizable(true),
-            |ctx, class| {
-                let close_requested = ctx.input(|input| input.viewport().close_requested());
-                if class != egui::ViewportClass::Embedded && close_requested {
+            move |ctx, class| {
+                if busy {
+                    ctx.request_repaint_after(super::TASK_REFRESH_INTERVAL);
+                }
+                let embedded = class == egui::ViewportClass::Embedded;
+                if !embedded && ctx.input(|input| input.viewport().close_requested()) {
                     if !busy {
-                        return true;
+                        window.close(ctx);
+                        return;
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 }
 
-                let mut close = false;
                 let content = |ui: &mut egui::Ui| {
-                    close = i18n::with_language(self.control.language, || self.content(ui, busy));
+                    let close =
+                        i18n::with_language(window.control.language, || window.content(ui, busy));
+                    if close {
+                        window.close(ctx);
+                    }
                 };
-                if class == egui::ViewportClass::Embedded {
+                if embedded {
                     egui::Window::new(&title)
-                        .id(egui::Id::new(self.id))
+                        .id(egui::Id::new(window.id))
                         .show(ctx, content);
                 } else {
                     egui::CentralPanel::default().show(ctx, content);
                 }
-                close
             },
-        )
+        );
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    fn close(&self, ctx: &egui::Context) {
+        self.closed.store(true, Ordering::Relaxed);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
     fn content(&self, ui: &mut egui::Ui, busy: bool) -> bool {
@@ -384,6 +401,30 @@ impl TaskWindow {
 mod tests {
     use super::*;
     use anyhow::{anyhow, bail};
+
+    #[test]
+    fn task_window_registers_an_independent_native_repaint_callback() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let window = TaskWindow {
+            control: Arc::new(TaskControl {
+                language: i18n::language(),
+                cancellable: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                state: Mutex::new(TaskState::new("test task")),
+            }),
+            id: egui::ViewportId::from_hash_of("test task"),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(!window.show(ctx, true));
+        });
+
+        let viewport = &output.viewport_output[&window.id];
+        assert!(viewport.class == egui::ViewportClass::Deferred);
+        assert!(viewport.viewport_ui_cb.is_some());
+    }
 
     #[test]
     fn progress_logs_on_phase_change_and_at_most_once_per_second_within_a_phase() {
