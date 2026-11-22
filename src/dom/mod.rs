@@ -528,11 +528,16 @@ fn compute_with_storage(
     pool: Option<&ThreadPool>,
     storage: Storage<'_>,
 ) -> Result<Vec<PathBuf>> {
+    const MODEL_COMPLETE: f32 = 0.20;
+    const RASTER_COMPLETE: f32 = 0.80;
     let (summary, mut mesh, crs) = prepare(
         request,
         cancelled,
         &mut |mut event| {
-            event.display.fraction = event.display.fraction.map(|fraction| fraction * 0.20);
+            event.display.fraction = event
+                .display
+                .fraction
+                .map(|fraction| fraction * MODEL_COMPLETE);
             progress(event);
         },
         storage,
@@ -581,7 +586,7 @@ fn compute_with_storage(
         progress(TaskProgress::new(
             Phase::IndexTriangles,
             message!(build_triangle_index),
-            Some(0.20),
+            Some(MODEL_COMPLETE),
         ));
         Some(raster::index(&mesh.triangles))
     };
@@ -589,8 +594,10 @@ fn compute_with_storage(
     progress(TaskProgress::new(
         Phase::Rasterize,
         message!(rasterize_0_count_blocks, count = count),
-        Some(0.50),
+        Some(MODEL_COMPLETE),
     ));
+    let raster_fraction =
+        |done| MODEL_COMPLETE + (RASTER_COMPLETE - MODEL_COMPLETE) * (done as f32 / count as f32);
     let mut done = 0_u64;
     let mut dsm_valid_pixels = 0_u64;
     let mut dom_valid_pixels = 0_u64;
@@ -619,7 +626,7 @@ fn compute_with_storage(
                 TaskProgress::new(
                     Phase::Rasterize,
                     message!(rasterize_done_count_blocks, done = done, count = count),
-                    Some(0.50 + 0.30 * (done as f32 / count as f32)),
+                    Some(raster_fraction(done)),
                 )
                 .with_concurrency(batch.len()),
             );
@@ -645,7 +652,7 @@ fn compute_with_storage(
             progress(TaskProgress::new(
                 Phase::Rasterize,
                 message!(rasterize_done_count_blocks, done = done, count = count),
-                Some(0.50 + 0.30 * (done as f32 / count as f32)),
+                Some(raster_fraction(done)),
             ));
         }
     }
@@ -671,7 +678,7 @@ fn compute_with_storage(
     progress(TaskProgress::new(
         Phase::BuildOverviews,
         message!(build_internal_overviews),
-        Some(0.80),
+        Some(RASTER_COMPLETE),
     ));
     tiff_output::overviews(
         &mut dsm_file,

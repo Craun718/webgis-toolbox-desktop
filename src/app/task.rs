@@ -65,7 +65,9 @@ impl TaskState {
         self.stage.phase = event.phase;
         self.stage.name = event.display.stage;
         let fraction = event.display.fraction;
-        self.stage.fraction = fraction;
+        if event.phase != Phase::SpillGeometry || fraction.is_some() {
+            self.stage.fraction = fraction;
+        }
         if changed
             || self
                 .last_progress_log
@@ -424,6 +426,22 @@ mod tests {
         let viewport = &output.viewport_output[&window.id];
         assert!(viewport.class == egui::ViewportClass::Deferred);
         assert!(viewport.viewport_ui_cb.is_some());
+    }
+
+    #[test]
+    fn geometry_spill_keeps_the_last_visible_progress() {
+        let mut state = TaskState::new("OSGB 转 DSM");
+        let now = Instant::now();
+        for (phase, label, reported, visible) in [
+            (Phase::ReadModel, "读取模型", Some(0.12), 0.12),
+            (Phase::SpillGeometry, "迁移几何和索引", None, 0.12),
+            (Phase::SpillGeometry, "已写入 1000 个三角形", None, 0.12),
+            (Phase::ReadModel, "继续读取模型", Some(0.13), 0.13),
+        ] {
+            state.update(TaskProgress::new(phase, label, reported), now);
+            assert_eq!(state.stage.name, label);
+            assert_eq!(state.stage.fraction, Some(visible));
+        }
     }
 
     #[test]

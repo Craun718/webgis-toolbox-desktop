@@ -430,7 +430,7 @@ fn rust_writes_verified_products_and_cancellation_preserves_them() {
         .position(|event| event.stage == "构建三角形索引")
         .unwrap();
     assert_eq!(progress[index].fraction, Some(0.20));
-    assert_eq!(progress[index + 1].fraction, Some(0.50));
+    assert_eq!(progress[index + 1].fraction, Some(0.20));
     assert!(progress.iter().any(|event| event.stage == "校验写出结果"));
     assert_eq!(files.len(), PRODUCTS.len());
     let original: Vec<_> = files.iter().map(|p| fs::read(p).unwrap()).collect();
@@ -668,6 +668,7 @@ fn small_budget_spills_pageable_geometry_and_preflight_stays_page_local() -> Res
     memory::configure(16 * memory::MIB);
     let stage = StagedRaster::new(&request)?;
     let mut spilled = false;
+    let mut raster_start = None;
     let products = compute_with_storage(
         &request,
         &stage.output,
@@ -676,11 +677,15 @@ fn small_budget_spills_pageable_geometry_and_preflight_stays_page_local() -> Res
         |event| {
             spilled |=
                 event.phase == Phase::SpillGeometry && event.display.stage.contains("个三角形");
+            if event.phase == Phase::Rasterize && raster_start.is_none() {
+                raster_start = event.display.fraction;
+            }
         },
         None,
         Storage::Auto(stage.path()),
     )?;
     assert!(spilled);
+    assert_eq!(raster_start, Some(0.20));
     assert_eq!(fs::read_dir(stage.path())?.count(), PRODUCTS.len());
     stage.publish(false)?;
     assert!(products.iter().all(|path| path.is_file()));
