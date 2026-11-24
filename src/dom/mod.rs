@@ -781,10 +781,26 @@ fn check_conflicts(output: &Path, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn rename_new(src: &Path, dst: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, src, CWD, dst, RenameFlags::NOREPLACE)
         .with_context(|| format!("{} → {}", src.display(), dst.display()))
+}
+
+#[cfg(windows)]
+fn rename_new(src: &Path, dst: &Path) -> Result<()> {
+    use std::{io, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let from: Vec<_> = src.as_os_str().encode_wide().chain([0]).collect();
+    let to: Vec<_> = dst.as_os_str().encode_wide().chain([0]).collect();
+    // The paths are derived from a canonicalized output path and fixed filenames.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("{} → {}", src.display(), dst.display()));
+    }
+    Ok(())
 }
 
 fn publish(stage: &Path, output: &Path, overwrite: bool) -> Result<()> {

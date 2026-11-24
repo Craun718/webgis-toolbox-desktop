@@ -4027,6 +4027,7 @@ dependencies = [
  "walkdir",
  "webgis-core",
  "weezl 0.1.12",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

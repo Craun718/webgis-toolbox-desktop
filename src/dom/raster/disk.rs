@@ -26,9 +26,8 @@ pub(super) struct DiskMesh {
 
 impl DiskMesh {
     pub fn new(stage: &Path, chunked: bool) -> Result<Self> {
-        let free = rustix::fs::statvfs(stage)?;
         ensure!(
-            free.f_bavail.saturating_mul(free.f_frsize) >= 1024 * 1024,
+            available_disk_bytes(stage)? >= 1024 * 1024,
             message!(osgb_disk_full)
         );
         let cache_kib = (memory::available_budget() / 32 / 1024).clamp(128, 16 * 1024);
@@ -296,6 +295,34 @@ fn reclaim(path: &Path) {
         let _ = file.sync_data();
         let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed);
     }
+}
+
+#[cfg(unix)]
+fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
+    let free = rustix::fs::statvfs(path)?;
+    Ok(free.f_bavail.saturating_mul(free.f_frsize))
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::{io, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut available = 0;
+    // The path is null-terminated and the other output fields are optional.
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
 }
 
 #[cfg(test)]
