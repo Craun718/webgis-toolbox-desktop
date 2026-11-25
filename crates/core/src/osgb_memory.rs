@@ -59,7 +59,7 @@ impl std::fmt::Display for BudgetError {
 impl std::error::Error for BudgetError {}
 
 pub fn reserve(bytes: usize, unit: impl std::fmt::Display) -> Result<Reservation, BudgetError> {
-    USED.fetch_update(Relaxed, Relaxed, |used| {
+    USED.try_update(Relaxed, Relaxed, |used| {
         used.checked_add(bytes).filter(|&total| total <= limit())
     })
     .map_err(|used| {

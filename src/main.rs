@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use webgis_core::{i18n::with_language, message};
 mod app;
 mod console;
