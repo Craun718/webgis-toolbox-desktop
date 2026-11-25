@@ -575,6 +575,7 @@ enum PathPicker<'a> {
     File(&'static str, &'static [&'static str]),
     FileOrFolder(&'static str, &'static [&'static str]),
     Folder,
+    OutputFolder(&'static str),
     NewFolder,
     SaveFile(&'static str, &'static [&'static str], &'a str),
 }
@@ -667,6 +668,22 @@ fn path_field(
                             .filter(|_| !current.is_dir());
                         // 导出任务会创建目录，因此这里只选定目标路径。
                         picked = dialog(None, file_dialog::Selection::Save(name));
+                    }
+                }
+                PathPicker::OutputFolder(default_name) => {
+                    let title = message!(browse_output_folder);
+                    if ui.button(title).clicked() {
+                        let name = current
+                            .file_name()
+                            .filter(|_| !current.is_dir())
+                            .unwrap_or_else(|| default_name.as_ref());
+                        picked = file_dialog::select(
+                            title,
+                            directory,
+                            None,
+                            file_dialog::Selection::Folder,
+                        )
+                        .map(|parent| parent.join(name));
                     }
                 }
                 PathPicker::Folder => {}

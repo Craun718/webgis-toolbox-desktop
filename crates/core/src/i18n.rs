@@ -459,6 +459,9 @@ macro_rules! message {
     (tile_output_folder) => {
         $crate::localized_template!("瓦片输出目录", "Tile output folder", "タイルの出力フォルダー")
     };
+    (browse_output_folder) => {
+        $crate::localized_template!("选择输出目录", "Select output folder", "出力フォルダーを選択")
+    };
     (new_folder_2) => {
         $crate::localized_template!("新目录", "New folder", "新規フォルダー")
     };

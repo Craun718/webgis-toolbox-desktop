@@ -62,7 +62,7 @@ impl Form {
             message!(tile_output_folder),
             &mut self.output,
             message!(new_folder_2),
-            PathPicker::NewFolder,
+            PathPicker::OutputFolder("terrain"),
         );
         ui.horizontal(|ui| {
             ui.label(message!(terrain_profile));
