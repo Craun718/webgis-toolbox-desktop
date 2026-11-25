@@ -26,7 +26,7 @@ enum Profile {
 impl Profile {
     fn name(self) -> &'static str {
         match self {
-            Self::Geodetic => "Geodetic (EPSG:4326)",
+            Self::Geodetic => "WGS84 (EPSG:4326)",
             Self::Mercator => "Mercator (EPSG:3857)",
         }
     }
