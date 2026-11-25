@@ -568,9 +568,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.8"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac230478587d0269d8d6998b82ae69ea51509d55df66d9e92edd1f986904cd4a"
+checksum = "50066ca966813ca8957ee15361752f19424a8ff620dbe9c8993d9f99d99b04b3"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -578,9 +578,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.7"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+checksum = "a0ed97c96ef4efb3cc84e09fa388df4463e7cc3224ec38d7b1d9e45749333590"
 dependencies = [
  "anstream",
  "anstyle",
@@ -590,9 +590,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "895c9d8d2ac2dd8b8a29f3724a14e72aaaa6debcf8c38c82f97305c6a172767a"
+checksum = "b4c174f11f949b9ca8c60580925e282b9cbd5454750e506f08648b2038080cd7"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -765,7 +765,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "ctb-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "flate2",
@@ -1328,15 +1328,15 @@ dependencies = [
 
 [[package]]
 name = "geotiff-core"
-version = "0.8.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0aabc02937367301c20568e20f83c67c6796a9c225ffe83f67f03d517d4deea"
+checksum = "7bddf1f3cee6f1a3ec78eabba1288418c33cdf30829642dd91c10e7f3f98ac12"
 
 [[package]]
 name = "geotiff-reader"
-version = "0.8.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e0bdc8388dbf26105a2954a14add4621e4635a6ea6e838973bc4760c6fc90f"
+checksum = "9b3e65addcf8c1c4d1f35256706afb71f6b9cbb9da3183dcca6f353512673b53"
 dependencies = [
  "geotiff-core",
  "ndarray",
@@ -1346,16 +1346,16 @@ dependencies = [
 
 [[package]]
 name = "geotiff-writer"
-version = "0.8.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43a9d08d78acf634cdfe8c5f47d8a692e3e3786ec1890822afc1d11ff3bccf00"
+checksum = "fd2a5f6387d1928df9d15905c4e282385d7d6b43e47ab0d38ba1bfb9fccc9337"
 dependencies = [
  "geotiff-core",
  "ndarray",
  "tempfile",
  "thiserror 2.0.21",
- "tiff-core 0.8.1",
- "tiff-writer 0.8.1",
+ "tiff-core",
+ "tiff-writer",
 ]
 
 [[package]]
@@ -1528,6 +1528,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
@@ -1860,15 +1863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
-dependencies = [
- "rayon",
-]
-
-[[package]]
 name = "jpeg-encoder"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1892,18 +1886,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
-name = "lerc-band-materialize"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c7ea338fd659c5fdf23de24ec878e31eeacf55b839d74c355a00f602e1f519d"
-
-[[package]]
-name = "lerc-core"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c52050f983cb85074a1b9107a6db8b3c8242e9261f42c3e319ada57b2acca2e"
-
-[[package]]
 name = "lerc-core"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1911,22 +1893,12 @@ checksum = "a393a8871cff51fc7469d84a96c4b2ddba887d85d89609b1689364baac8cd881"
 
 [[package]]
 name = "lerc-reader"
-version = "0.4.3"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42bf327f4c6b9fd69e1e7bf7fccf0fabb3cf9d074b862ae59f69fd069388ef14"
+checksum = "6e876b00fd61cabb5a274d1eaaec252efced767fecd8a2ae1709259c22d733ec"
 dependencies = [
- "lerc-band-materialize",
- "lerc-core 0.4.3",
+ "lerc-core",
  "ndarray",
-]
-
-[[package]]
-name = "lerc-writer"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e44ac5a9f7b1069751e7138a82a42fd37c17e8605a79d38d6ccf6e9e3ced5721"
-dependencies = [
- "lerc-core 0.4.3",
 ]
 
 [[package]]
@@ -1935,7 +1907,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0386d9f86240d1d3e386b0a6478b280c8971585d3e45fdcd25e324c189a7607c"
 dependencies = [
- "lerc-core 0.5.2",
+ "lerc-core",
 ]
 
 [[package]]
@@ -2024,11 +1996,11 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "d4e2a1b977b42ee8b53a2a4adbd1183431c493f1d1960b7ccd893e2f0b9407ba"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3084,9 +3056,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ruzstd"
-version = "0.8.1"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640bec8aad418d7d03c72ea2de10d5c646a598f9883c7babc160d91e3c1b26c"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 dependencies = [
  "twox-hash",
 ]
@@ -3452,15 +3424,6 @@ dependencies = [
 
 [[package]]
 name = "tiff-core"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d9ad8cb710e3d24be6d14128493868a01442151dccc29351d964dff4916e49"
-dependencies = [
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "tiff-core"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e31583daf7ed4f02bb4266142e5b8cf64b6ff3518739130706dfef7a220e4b2"
@@ -3470,14 +3433,13 @@ dependencies = [
 
 [[package]]
 name = "tiff-reader"
-version = "0.8.1"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6217943cbf5466f97e72a02a0e33a0f2258617439215c1090568171f65323546"
+checksum = "ffd1e5c429933529ac05102f1105f02c45350dd8be1cc5ec5195c4eda229784a"
 dependencies = [
  "flate2",
  "image-webp",
- "jpeg-decoder",
- "lerc-core 0.4.3",
+ "lerc-core",
  "lerc-reader",
  "lru",
  "memmap2",
@@ -3486,24 +3448,10 @@ dependencies = [
  "rayon",
  "ruzstd",
  "thiserror 2.0.21",
- "tiff-core 0.8.1",
- "weezl 0.1.12",
-]
-
-[[package]]
-name = "tiff-writer"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f40a943c948dc4348f5a2de9ee8f5aebbbc1a3759241e394660b3604be09a7"
-dependencies = [
- "flate2",
- "jpeg-encoder",
- "lerc-core 0.4.3",
- "lerc-writer 0.4.3",
- "ruzstd",
- "thiserror 2.0.21",
- "tiff-core 0.8.1",
- "weezl 0.1.12",
+ "tiff-core",
+ "weezl 0.2.1",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3513,10 +3461,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba412275faf9c55b50db66ea49f98bca54f11c16fba0927068abdef1ae28b852"
 dependencies = [
  "flate2",
- "lerc-core 0.5.2",
- "lerc-writer 0.5.2",
+ "jpeg-encoder",
+ "lerc-core",
+ "lerc-writer",
+ "ruzstd",
  "thiserror 2.0.21",
- "tiff-core 0.11.1",
+ "tiff-core",
  "weezl 0.2.1",
 ]
 
@@ -3532,8 +3482,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiff",
- "tiff-core 0.11.1",
- "tiff-writer 0.11.1",
+ "tiff-core",
+ "tiff-writer",
  "webgis-core",
 ]
 
