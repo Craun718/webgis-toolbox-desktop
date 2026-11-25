@@ -45,9 +45,19 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-      - name: Upload executable
+      - name: Test CJK font loading
+        run: cargo test --release --locked --bin webgis-toolbox app::fonts::tests
+
+      - name: Prepare distribution
+        shell: bash
+        run: |
+          mkdir -p dist/fonts
+          cp "${{ matrix.binary }}" dist/
+          cp fonts/*.otf fonts/OFL.txt dist/fonts/
+
+      - name: Upload distribution
         uses: actions/upload-artifact@v4
         with:
           name: webgis-toolbox-${{ matrix.name }}
-          path: ${{ matrix.binary }}
+          path: dist/
           if-no-files-found: error

@@ -5,6 +5,7 @@ use webgis_core::{
 };
 use webgis_toolbox::dom::{self, Phase, TaskProgress};
 mod file_dialog;
+mod fonts;
 pub(crate) mod osgb_worker;
 mod settings;
 mod task;
@@ -12,10 +13,11 @@ mod terrain;
 
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, Context as EguiContext, RichText, Ui};
+use fonts::install_font;
 use settings::Settings;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::mpsc,
 };
 use task::{TaskContext, TaskWindow, Worker};
 use tiles_toolbox::{
@@ -277,11 +279,7 @@ impl App {
                 ui.add_space(12.);
                 ui.heading(self.selected.name());
                 if !self.font_loaded {
-                    ui.label(if i18n::language() == Language::Japanese {
-                        message!(missing_japanese_font)
-                    } else {
-                        message!(missing_chinese_font)
-                    });
+                    ui.label("CJK fonts unavailable. Restore the fonts directory beside the executable or set WEBGIS_CJK_FONT to a font file.");
                 }
                 ui.add_space(14.);
                 if self.selected == Tool::Settings {
@@ -384,73 +382,6 @@ fn processing_pool(threads: usize) -> Result<Option<ThreadPool>> {
         .build()
         .map(Some)
         .context(message!(could_not_create_the_task_thread_pool))
-}
-
-fn install_font(ctx: &EguiContext, language: Language) -> bool {
-    let japanese = language == Language::Japanese;
-    let family = if japanese {
-        "Noto Sans CJK JP"
-    } else {
-        "Noto Sans CJK SC"
-    };
-    let system_match = std::process::Command::new("fc-match")
-        .args(["-f", "%{family}\n%{file}\n%{index}", family])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| {
-            let output = String::from_utf8(output.stdout).ok()?;
-            let mut lines = output.lines();
-            let matches = lines.next()?.split(',').any(|name| name == family);
-            let path = PathBuf::from(lines.next()?);
-            let index = lines.next()?.parse().ok()?;
-            matches.then_some((path, index))
-        });
-    let noto_index = if japanese { 0 } else { 2 };
-    let noto = [
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ]
-    .map(|path| (PathBuf::from(path), noto_index));
-    let chinese = [
-        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
-        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    ]
-    .map(|path| (PathBuf::from(path), 0));
-    let configured = std::env::var_os("WEBGIS_CJK_FONT")
-        .map(PathBuf::from)
-        .map(|path| {
-            let index = if path
-                .file_name()
-                .is_some_and(|name| name == "NotoSansCJK-Regular.ttc")
-            {
-                noto_index
-            } else {
-                0
-            };
-            (path, index)
-        });
-    let mut fonts = egui::FontDefinitions::default();
-    for (path, index) in configured
-        .into_iter()
-        .chain(system_match)
-        .chain(noto)
-        .chain(chinese.into_iter().filter(|_| !japanese))
-    {
-        if let Ok(bytes) = std::fs::read(&path) {
-            let mut font = egui::FontData::from_owned(bytes);
-            font.index = index;
-            fonts.font_data.insert("CJK".into(), Arc::new(font));
-            for family in fonts.families.values_mut() {
-                family.push("CJK".into());
-            }
-            ctx.set_fonts(fonts);
-            return true;
-        }
-    }
-    ctx.set_fonts(fonts);
-    false
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

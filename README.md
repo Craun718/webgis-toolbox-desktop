@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-WebGIS Toolbox is a Linux desktop application for converting OSGB models to DOM and DSM rasters, processing GeoTIFFs and map tiles, and clipping OSGB models.
+WebGIS Toolbox is a cross-platform desktop application for converting OSGB models to DOM and DSM rasters, processing GeoTIFFs and map tiles, and clipping OSGB models.
 
 ## Build and run
 
@@ -13,10 +13,10 @@ Initialize the pinned `ctb-rs` submodule after cloning. The build can skip Git L
 ```sh
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
 cargo build --locked
-./target/debug/webgis-toolbox
+cargo run --locked
 ```
 
-The Chinese-language egui interface uses Glow and supports Wayland and X11. It looks for Source Han Sans, Noto Sans CJK, or WenQuanYi Micro Hei on the system. Set `WEBGIS_CJK_FONT` to use a specific font file.
+The egui interface uses Glow; on Linux, it supports Wayland and X11. The app automatically looks for system CJK fonts on Windows, macOS, and Linux. Keep the distribution’s `fonts/` directory next to the executable for offline fallback. It contains Noto Sans CJK SC and JP (Sans 2.004) and their SIL Open Font License. Set `WEBGIS_CJK_FONT` to a font file to give it priority over system and bundled fonts.
 
 ## Tools
 

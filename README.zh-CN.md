@@ -2,17 +2,17 @@
 
 [English](README.md) | 简体中文
 
-Linux 上的中文 egui 桌面应用，支持 OSGB 转 DOM / DSM、栅格处理、瓦片处理和 OSGB 模型裁剪。
+跨平台 egui 桌面应用，支持 OSGB 转 DOM / DSM、栅格处理、瓦片处理和 OSGB 模型裁剪。
 
 克隆仓库后初始化固定版本的 `ctb-rs` 子模块。常规构建可跳过 Git LFS 样例栅格下载。
 
 ```sh
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
 cargo build --locked
-./target/debug/webgis-toolbox
+cargo run --locked
 ```
 
-应用使用 Glow，支持 Wayland 和 X11。界面优先加载系统的思源黑体、Noto Sans CJK 或文泉驿微米黑，也可通过 `WEBGIS_CJK_FONT` 指定字体文件。构建使用 Rust 工具链和系统链接器。编译、启动、所有工具及完整测试套件均无需 GDAL 库或命令行工具。
+应用使用 Glow，在 Linux 上支持 Wayland 和 X11。应用在 Windows、macOS 和 Linux 上自动查找系统 CJK 字体。请将发布包的 `fonts/` 目录保留在可执行文件旁，以便离线回退。目录包含 Noto Sans CJK SC 和 JP（Sans 2.004）以及 SIL 开放字体许可证。可通过 `WEBGIS_CJK_FONT` 指定优先于系统和随包字体使用的字体文件。构建使用 Rust 工具链和系统链接器。编译、启动、所有工具及完整测试套件均无需 GDAL 库或命令行工具。
 
 - **OSGB 转 DOM / DSM** 的模型输入可选择根 OSGB 文件或 `metadata.xml`。选择 `metadata.xml` 时优先从同目录的 `Block.osgb` 进入。转换器沿 PagedLOD 引用遍历场景树，保留各分支的叶节点几何，支持分支在不同 LOD 终止。无 `Block.osgb` 的目录会递归扫描文件，对符合 ContextCapture 命名约定的分片按模型组选最高 LOD。支持预检所选文件、LOD、坐标模式、范围和栅格尺寸。相对原点模式从 `metadata.xml` 读取坐标系及原点，支持手动覆盖。绝对坐标模式直接使用模型坐标，本地模式生成无 CRS 的栅格。默认像元尺寸为 0.05 个坐标单位。
 - **栅格处理 → 生成 COG 云优化 GeoTIFF**。每次选择一个内嵌地理参考的 `.tif` 或 `.tiff`，然后指定保存位置，默认在源文件同目录生成 `<源文件名>_cog.tif`。支持条带或分块存储的 8 位灰度、灰度加 Alpha、RGB、RGBA 和单波段 Float32 高程 GeoTIFF。输出为 256 × 256 分块、无损 DEFLATE 压缩的 BigTIFF，内部概览采用最近邻抽样。保留原始分辨率的像元、Alpha、内部掩膜、NoData 和地理参考。任务可在发布前取消，输出须指定新文件路径。
