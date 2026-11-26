@@ -18,6 +18,10 @@ cargo run --locked
 
 The egui interface uses Glow; on Linux, it supports Wayland and X11. The app automatically looks for system CJK fonts on Windows, macOS, and Linux. Keep the distribution’s `fonts/` directory next to the executable for offline fallback. It contains Noto Sans CJK SC and JP (Sans 2.004) and their SIL Open Font License. Set `WEBGIS_CJK_FONT` to a font file to give it priority over system and bundled fonts.
 
+## Releases
+
+Download the archive for your platform from [GitHub Releases](https://github.com/Craun718/webgis-toolbox-desktop/releases). Extract the whole archive so that `fonts/` stays next to the executable.
+
 ## Tools
 
 - **OSGB to DOM and DSM.** Select a root OSGB file or the model’s `metadata.xml`. Selecting `metadata.xml` uses `Block.osgb` as the entry when present. The converter follows PagedLOD references and retains leaf geometry from each branch, even when branches end at different levels. For directories without `Block.osgb`, it scans the directory tree and uses the highest LOD per group for files that follow the ContextCapture naming convention. Preview the selected files, level of detail (LOD), coordinate mode, extent, and raster dimensions. Relative-origin mode reads the coordinate reference system (CRS) and origin from `metadata.xml` and accepts manual overrides. Absolute mode uses model coordinates directly. Local mode produces rasters without a CRS. The default pixel size is 0.05 coordinate units.

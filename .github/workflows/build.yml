@@ -2,6 +2,11 @@ name: Build
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
 
 permissions:
@@ -61,3 +66,66 @@ jobs:
           name: webgis-toolbox-${{ matrix.name }}
           path: dist/
           if-no-files-found: error
+
+      - name: Package release archive
+        if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.name }}
+        run: |
+          mkdir -p release
+          cp LICENSE dist/
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            python -m zipfile -c "release/webgis-toolbox-${PLATFORM}.zip" dist/*
+          else
+            tar -czf "release/webgis-toolbox-${PLATFORM}.tar.gz" -C dist .
+          fi
+
+      - name: Upload release archive
+        if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release/
+          merge-multiple: true
+
+      - name: Publish archives
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          assets=(
+            release/webgis-toolbox-linux-x86_64.tar.gz
+            release/webgis-toolbox-windows-x86_64.zip
+            release/webgis-toolbox-macos-arm64.tar.gz
+          )
+          for asset in "${assets[@]}"; do
+            if [[ ! -s "$asset" ]]; then
+              echo "Missing or empty release archive: $asset" >&2
+              exit 1
+            fi
+          done
+          flags=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${flags[@]}" "${assets[@]}"
