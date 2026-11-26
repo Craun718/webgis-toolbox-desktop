@@ -2,7 +2,7 @@
 use anyhow::Result;
 use ctb_rs::{
     grid::{TileCoord, TileGrid},
-    raster::{Crs, RasterSource, transform_coordinate},
+    raster::{Crs, RasterSource, transform_coordinate, transform_warp_coordinate},
     sampling::{ResamplingMethod, sample_at},
 };
 
@@ -16,15 +16,20 @@ pub(super) fn encode(
         transform_coordinate(bounds.min_x, bounds.min_y, &grid.crs(), &Crs::Epsg4326)?;
     let (east, north) =
         transform_coordinate(bounds.max_x, bounds.max_y, &grid.crs(), &Crs::Epsg4326)?;
+    let metadata = source.metadata();
     let mut heights = Vec::with_capacity(4225);
     let mut positions = Vec::with_capacity(4225);
     for row in 0..65 {
         for col in 0..65 {
             let x = west + (east - west) * col as f64 / 64.0;
             let y = south + (north - south) * row as f64 / 64.0;
-            let (sx, sy) = transform_coordinate(x, y, &Crs::Epsg4326, &source.metadata().crs)?;
-            let h = sample_at(source, sx, sy, ResamplingMethod::Bilinear)?;
-            let h = if !h.is_finite() || source.metadata().no_data == Some(h) {
+            let (sx, sy) = transform_warp_coordinate(x, y, &Crs::Epsg4326, &metadata.crs)?;
+            let h = if sx.is_finite() && sy.is_finite() {
+                sample_at(source, sx, sy, ResamplingMethod::Bilinear)?
+            } else {
+                0.0
+            };
+            let h = if !h.is_finite() || metadata.no_data == Some(h) {
                 0.0
             } else {
                 h
@@ -133,6 +138,115 @@ fn encode_grid(heights: &[f64], positions: &[[f64; 3]]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctb_rs::{
+        CtbError,
+        grid::{GlobalGeodeticGrid, GlobalMercatorGrid},
+        raster::{AffineTransform, RasterMetadata, RasterSampleType, RasterWindow, WindowRequest},
+        tileset::TilesetPlan,
+    };
+
+    struct TestDem {
+        metadata: RasterMetadata,
+        elevation: Result<f64, CtbError>,
+    }
+
+    impl TestDem {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                metadata: RasterMetadata {
+                    width: 16,
+                    height: 16,
+                    band_count: 1,
+                    crs: Crs::Epsg(4545),
+                    transform: AffineTransform::north_up(498_000.0, 2_652_000.0, 250.0, -250.0)?,
+                    no_data: None,
+                    sample_type: RasterSampleType::Float64,
+                },
+                elevation: Ok(123.0),
+            })
+        }
+    }
+
+    impl RasterSource for TestDem {
+        fn metadata(&self) -> &RasterMetadata {
+            &self.metadata
+        }
+
+        fn overview_count(&self) -> u16 {
+            0
+        }
+
+        fn read_window(&self, request: WindowRequest) -> Result<RasterWindow, CtbError> {
+            let height = self.elevation.clone()?;
+            Ok(RasterWindow {
+                request,
+                samples: vec![height; (request.width * request.height) as usize].into(),
+            })
+        }
+    }
+
+    fn decode_heights(bytes: &[u8]) -> Vec<f32> {
+        let min = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        let max = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[88..92].try_into().unwrap()) as usize;
+        assert_eq!(count, 4225);
+        let mut height = 0;
+        bytes[92 + 4 * count..92 + 6 * count]
+            .chunks_exact(2)
+            .map(|delta| {
+                let code = i32::from(u16::from_le_bytes(delta.try_into().unwrap()));
+                height += (code >> 1) ^ -(code & 1);
+                assert!((0..=32767).contains(&height));
+                min + (max - min) * (height as f32 / 32767.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn projected_dem_mesh_preserves_detail_and_fills_root_projection_gaps() -> Result<()> {
+        let source = TestDem::new()?;
+        for grid in [
+            &GlobalGeodeticGrid::new(65)? as &dyn TileGrid,
+            &GlobalMercatorGrid::new(256)?,
+        ] {
+            let plan =
+                TilesetPlan::from_raster_with_tile_grid(source.metadata(), grid, None, None)?;
+            let root = &plan.levels[0];
+            assert_eq!(root.zoom, 0);
+            assert_eq!(root.tiles.len(), 1);
+            let heights = decode_heights(&encode(&source, grid, root.tiles[0])?);
+            assert!(heights.iter().all(|&height| height == 0.0));
+
+            let mut heights = Vec::new();
+            for &tile in &plan.levels.last().unwrap().tiles {
+                heights.extend(decode_heights(&encode(&source, grid, tile)?));
+            }
+            assert!(heights.contains(&123.0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_propagates_unknown_crs_and_raster_read_errors() -> Result<()> {
+        let mut source = TestDem::new()?;
+        let grid = GlobalGeodeticGrid::new(65)?;
+        let plan =
+            TilesetPlan::from_raster_with_tile_grid(source.metadata(), &grid, Some(11), Some(11))?;
+        let detail = plan.levels[0].tiles[0];
+        let read_error = CtbError::RasterRead("test read failure".to_owned());
+        source.elevation = Err(read_error.clone());
+        let error = encode(&source, &grid, detail).unwrap_err();
+        assert_eq!(error.downcast_ref::<CtbError>(), Some(&read_error));
+
+        source.metadata.crs = Crs::Epsg(u16::MAX);
+        let error = encode(&source, &grid, detail).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<CtbError>(),
+            Some(CtbError::UnsupportedCrs(_))
+        ));
+        Ok(())
+    }
+
     #[test]
     fn mesh_indices_and_edges_are_valid() -> Result<()> {
         let bytes = encode_grid(&vec![12.0; 4225], &vec![[1.0, 2.0, 3.0]; 4225])?;
