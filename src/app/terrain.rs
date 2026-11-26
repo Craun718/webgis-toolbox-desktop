@@ -6,7 +6,10 @@ use ctb_rs::{
     grid::{GlobalGeodeticGrid, GlobalMercatorGrid, TileGrid},
     raster::RasterSource,
     sampling::ResamplingMethod::Average,
-    tileset::{HeightmapTilesetOptions, TileWriteProgress, write_heightmap_tileset_with_factory},
+    tileset::{
+        HeightmapTilesetOptions, TileWriteProgress, write_heightmap_tileset_with_factory,
+        write_layer_json,
+    },
 };
 use eframe::egui::{ComboBox, Context as EguiContext, Ui};
 use std::sync::{Arc, Mutex};
@@ -39,13 +42,26 @@ impl Profile {
     }
 }
 
-#[derive(Default)]
 pub(super) struct Form {
     input: String,
     output: String,
     profile: Profile,
     min_zoom: String,
     max_zoom: String,
+    generate_layer_json: bool,
+}
+
+impl Default for Form {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            output: String::new(),
+            profile: Profile::default(),
+            min_zoom: String::new(),
+            max_zoom: String::new(),
+            generate_layer_json: true,
+        }
+    }
 }
 
 impl Form {
@@ -81,6 +97,10 @@ impl Form {
             &mut self.max_zoom,
             message!(zoom_from_source_resolution),
         );
+        ui.checkbox(
+            &mut self.generate_layer_json,
+            message!(terrain_generate_layer_json),
+        );
         ui.label(message!(terrain_output_description));
     }
 
@@ -88,6 +108,7 @@ impl Form {
         let input = required_path(message!(terrain_dem), &self.input)?;
         let output = required_path(message!(tile_output_folder), &self.output)?;
         let profile = self.profile;
+        let generate_layer_json = self.generate_layer_json;
         let options = HeightmapTilesetOptions {
             resume: false,
             start_zoom: parse_zoom(&self.max_zoom, message!(terrain_max_zoom))?,
@@ -133,13 +154,16 @@ impl Form {
                         });
                     }
                 };
-                write_heightmap_tileset_with_factory(
+                let plan = write_heightmap_tileset_with_factory(
                     &source_factory,
                     grid.as_ref(),
                     staging,
                     options,
                     Some(&progress),
                 )?;
+                if generate_layer_json {
+                    write_layer_json(staging, grid.as_ref(), &plan)?;
+                }
                 task.publish_with_progress(Some(0.95))
             })?;
             Ok(Outcome::Artifacts {
@@ -160,4 +184,13 @@ fn parse_zoom(value: &str, label: &str) -> Result<Option<u8>> {
             .parse()
             .with_context(|| message!(invalid_terrain_zoom, label))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn layer_json_is_enabled_by_default() {
+        assert!(Form::default().generate_layer_json);
+    }
 }

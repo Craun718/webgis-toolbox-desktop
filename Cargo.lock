@@ -774,6 +774,7 @@ dependencies = [
  "ndarray",
  "proj4rs",
  "quick-xml",
+ "serde_json",
 ]
 
 [[package]]

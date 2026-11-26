@@ -180,6 +180,9 @@ macro_rules! message {
     (terrain_output_description) => {
         $crate::localized_template!("输出 TMS heightmap-1.0 瓦片（{z}/{x}/{y}.terrain）。", "Writes TMS heightmap-1.0 tiles ({z}/{x}/{y}.terrain).", "TMS heightmap-1.0 タイル（{z}/{x}/{y}.terrain）を出力します。")
     };
+    (terrain_generate_layer_json) => {
+        $crate::localized_template!("生成 layer.json", "Generate layer.json", "layer.json を生成")
+    };
     (terrain_tile_progress, $($args:tt)+) => {
         $crate::localized_template!("已生成 {} / {} 个地形瓦片", "Terrain tiles generated: {} / {}", "地形タイル生成済み {} / {}"; $($args)+)
     };
