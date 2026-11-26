@@ -22,15 +22,6 @@ The egui interface uses Glow; on Linux, it supports Wayland and X11. The app aut
 
 Download the archive for your platform from [GitHub Releases](https://github.com/Craun718/webgis-toolbox-desktop/releases). Extract the whole archive so that `fonts/` stays next to the executable.
 
-To publish, push a new version tag pointing to a commit that contains the release workflow:
-
-```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
-```
-
-After all three platform builds and their font tests succeed, GitHub Actions publishes the archives for Windows x86_64, Linux x86_64, and macOS arm64. A tag such as `v0.1.0-rc.1` creates a prerelease. Pull requests and ordinary branch pushes do not publish releases.
-
 ## Tools
 
 - **OSGB to DOM and DSM.** Select a root OSGB file or the model’s `metadata.xml`. Selecting `metadata.xml` uses `Block.osgb` as the entry when present. The converter follows PagedLOD references and retains leaf geometry from each branch, even when branches end at different levels. For directories without `Block.osgb`, it scans the directory tree and uses the highest LOD per group for files that follow the ContextCapture naming convention. Preview the selected files, level of detail (LOD), coordinate mode, extent, and raster dimensions. Relative-origin mode reads the coordinate reference system (CRS) and origin from `metadata.xml` and accepts manual overrides. Absolute mode uses model coordinates directly. Local mode produces rasters without a CRS. The default pixel size is 0.05 coordinate units.
