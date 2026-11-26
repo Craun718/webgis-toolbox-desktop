@@ -507,7 +507,6 @@ enum PathPicker<'a> {
     FileOrFolder(&'static str, &'static [&'static str]),
     Folder,
     OutputFolder(&'static str),
-    NewFolder,
     SaveFile(&'static str, &'static [&'static str], &'a str),
 }
 
@@ -589,16 +588,6 @@ fn path_field(
                             Some((name, extensions)),
                             file_dialog::Selection::Save(Some(file_name)),
                         );
-                    }
-                }
-                PathPicker::NewFolder => {
-                    if ui.button(message!(new_folder)).clicked() {
-                        let name = current
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .filter(|_| !current.is_dir());
-                        // 导出任务会创建目录，因此这里只选定目标路径。
-                        picked = dialog(None, file_dialog::Selection::Save(name));
                     }
                 }
                 PathPicker::OutputFolder(default_name) => {
@@ -1165,7 +1154,7 @@ impl TileForm {
                     message!(tile_output_folder),
                     &mut self.output,
                     message!(new_folder_2),
-                    PathPicker::NewFolder,
+                    PathPicker::OutputFolder("pyramid"),
                 );
             }
             TileOp::Stacta => {
@@ -1187,7 +1176,7 @@ impl TileForm {
                         message!(xyz_output_folder),
                         &mut self.output,
                         message!(new_folder_2),
-                        PathPicker::NewFolder,
+                        PathPicker::OutputFolder("xyz"),
                     );
                 } else {
                     ui.label(message!(creates_stacta_json_in_the_input_folder));
@@ -1224,7 +1213,7 @@ impl TileForm {
                     message!(output_folder),
                     &mut self.output,
                     message!(new_folder_2),
-                    PathPicker::NewFolder,
+                    PathPicker::OutputFolder("tiles"),
                 );
             }
         }
