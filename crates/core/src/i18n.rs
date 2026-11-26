@@ -177,8 +177,14 @@ macro_rules! message {
     (zoom_from_source_resolution) => {
         $crate::localized_template!("根据源分辨率推导", "Derived from source resolution", "入力データの解像度から算出")
     };
+    (terrain_format) => {
+        $crate::localized_template!("地形格式", "Terrain format", "地形フォーマット")
+    };
+    (terrain_gzip) => {
+        $crate::localized_template!("启用 gzip 压缩", "Enable gzip compression", "gzip 圧縮を有効化")
+    };
     (terrain_output_description) => {
-        $crate::localized_template!("输出 TMS heightmap-1.0 瓦片（{z}/{x}/{y}.terrain）。", "Writes TMS heightmap-1.0 tiles ({z}/{x}/{y}.terrain).", "TMS heightmap-1.0 タイル（{z}/{x}/{y}.terrain）を出力します。")
+        $crate::localized_template!("输出 TMS 瓦片（{z}/{x}/{y}.terrain）。", "Writes TMS tiles ({z}/{x}/{y}.terrain).", "TMS タイル（{z}/{x}/{y}.terrain）を出力します。")
     };
     (terrain_generate_layer_json) => {
         $crate::localized_template!("生成 layer.json", "Generate layer.json", "layer.json を生成")
