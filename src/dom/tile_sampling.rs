@@ -1,8 +1,9 @@
 use super::{
     check_cancelled,
-    geotiff::{Affine, projection},
+    geotiff::{Affine, Crs, projection},
     tiff_output::TILE,
     tiff_source::Source,
+    tile_crs::TileCrs,
 };
 use anyhow::{Result, ensure};
 use image::{Rgba, RgbaImage};
@@ -27,14 +28,21 @@ pub(super) struct Grid {
 impl Grid {
     pub fn new(source: &Source) -> Result<Self> {
         let [width, height] = source.size.map(f64::from);
+        let (geographic, source_projection) = match &source.crs {
+            TileCrs::Epsg(Crs {
+                code: 3857 | 4326,
+                geographic,
+            }) => (*geographic, None),
+            TileCrs::Epsg(crs) => (crs.geographic, Some(projection(crs.code)?)),
+            TileCrs::Geographic { projection, .. } => (true, Some(projection.clone())),
+        };
         Ok(Self {
             transform: source.transform,
             inverse: source.transform.inverse()?,
-            projection: match source.crs.code {
-                3857 | 4326 => None,
-                code => Some((projection(code)?, projection(4326)?)),
-            },
-            geographic: source.crs.geographic,
+            projection: source_projection
+                .map(|source| Ok::<_, anyhow::Error>((source, projection(4326)?)))
+                .transpose()?,
+            geographic,
             central_lon: source.transform.model([width / 2., height / 2.])[0],
         })
     }

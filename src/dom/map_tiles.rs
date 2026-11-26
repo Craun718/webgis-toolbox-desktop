@@ -1,6 +1,6 @@
 use super::{
     Phase, TaskProgress, check_cancelled, tiff_output::TILE, tiff_source::Source,
-    tile_sampling::Grid,
+    tile_crs::TileCrs, tile_sampling::Grid,
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone};
@@ -84,7 +84,18 @@ pub fn run_with_pool(
 pub fn run_with_progress(
     request: &Request,
     cancelled: &AtomicBool,
+    progress: impl FnMut(TaskProgress),
+    publish: impl FnOnce() -> Result<()>,
+    pool: Option<&ThreadPool>,
+) -> Result<Vec<u8>> {
+    run_with_logging(request, cancelled, progress, |_| {}, publish, pool)
+}
+
+pub fn run_with_logging(
+    request: &Request,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(TaskProgress),
+    warn: impl FnOnce(&str),
     publish: impl FnOnce() -> Result<()>,
     pool: Option<&ThreadPool>,
 ) -> Result<Vec<u8>> {
@@ -104,8 +115,18 @@ pub fn run_with_progress(
         message!(select_a_tif_or_tiff_file)
     );
     check_cancelled(cancelled)?;
-    let source = Source::open(&request.input)
-        .with_context(|| message!(could_not_read, request.input.display()))?;
+    let open_source = || {
+        Source::open(&request.input)
+            .with_context(|| message!(could_not_read, request.input.display()))
+    };
+    let source = open_source()?;
+    if let TileCrs::Geographic { reason, .. } = &source.crs {
+        warn(&message!(
+            tile_crs_fallback_warning,
+            path = request.input.display(),
+            reason = reason
+        ));
+    }
     let grid = Grid::new(&source)?;
     let bounds = grid
         .bounds(source.size)
@@ -152,8 +173,7 @@ pub fn run_with_progress(
                 let tiles = task_pool::map_with(pool, batch, &mut readers, |(x, y), reader| {
                     check_cancelled(cancelled)?;
                     if reader.is_none() {
-                        let source = Source::open(&request.input)
-                            .with_context(|| message!(could_not_read, request.input.display()))?;
+                        let source = open_source()?;
                         let grid = Grid::new(&source)?;
                         *reader = Some((source, grid, buffer()));
                     }

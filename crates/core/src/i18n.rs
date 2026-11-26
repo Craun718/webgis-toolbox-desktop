@@ -684,6 +684,33 @@ macro_rules! message {
     (generate_stacta_index) => {
         $crate::localized_template!("生成 STACTA 索引", "Generate STACTA index", "STACTA インデックスを生成")
     };
+    (tile_crs_fallback_warning, $($args:tt)+) => {
+        $crate::localized_template!("{path}（{reason}），使用 GeoTIFF 地理坐标系参数，未应用到 WGS84 的基准转换", "{path} ({reason}). Using GeoTIFF geographic CRS parameters without applying a datum transformation to WGS84.", "{path}（{reason}）。GeoTIFF の地理座標参照系パラメーターを使用しました。WGS84 への測地基準系変換は適用していません。"; $($args)+)
+    };
+    (tile_crs_user_defined) => {
+        $crate::localized_template!("GeoTIFF 声明了自定义坐标系（32767）", "GeoTIFF declares a user-defined CRS (32767)", "GeoTIFF にユーザー定義の座標参照系（32767）が指定されています")
+    };
+    (tile_crs_fallback_failed, $($args:tt)+) => {
+        $crate::localized_template!("无法回退到 GeoTIFF 地理坐标系参数（{reason}）", "Cannot fall back to GeoTIFF geographic CRS parameters ({reason})", "GeoTIFF の地理座標参照系パラメーターを使用できません（{reason}）"; $($args)+)
+    };
+    (tile_crs_invalid_geokey, $($args:tt)+) => {
+        $crate::localized_template!("GeoKey {id} 缺失、无效或与其他参数冲突", "GeoKey {id} is missing, invalid, or conflicts with other parameters", "GeoKey {id} が欠落しているか、無効であるか、他のパラメーターと矛盾しています"; $($args)+)
+    };
+    (tile_crs_requires_geographic_2d) => {
+        $crate::localized_template!("GeoKey 必须明确声明二维地理坐标系", "GeoKeys must explicitly declare a two-dimensional geographic CRS", "GeoKey で二次元の地理座標参照系を明示する必要があります")
+    };
+    (tile_crs_requires_degrees) => {
+        $crate::localized_template!("GeoKey 角度单位必须为度", "GeoKey angular units must be degrees", "GeoKey の角度単位は度である必要があります")
+    };
+    (tile_crs_requires_greenwich) => {
+        $crate::localized_template!("GeoKey 必须指定格林尼治本初子午线，且经度参数不能与之冲突", "GeoKeys must specify the Greenwich prime meridian with a consistent longitude", "GeoKey でグリニッジ本初子午線を指定し、経度の値を一致させる必要があります")
+    };
+    (tile_crs_requires_meter_axes) => {
+        $crate::localized_template!("GeoKey 椭球轴长必须以米为单位", "GeoKey ellipsoid axis lengths must be in metres", "GeoKey の楕円体の軸長はメートル単位である必要があります")
+    };
+    (tile_crs_unsupported_datum) => {
+        $crate::localized_template!("GeoKey 声明了回退路径无法保留的基准或基准转换", "GeoKeys declare a datum or datum transformation that the fallback cannot preserve", "GeoKey で指定された測地基準系または測地基準系変換を維持できません")
+    };
     (id_cannot_be_empty) => {
         $crate::localized_template!("--id 不能为空", "--id cannot be empty", "--id を空にできません")
     };

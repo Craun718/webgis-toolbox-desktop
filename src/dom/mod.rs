@@ -7,6 +7,7 @@ mod raster;
 mod tiff_mask;
 mod tiff_output;
 mod tiff_source;
+mod tile_crs;
 mod tile_sampling;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};

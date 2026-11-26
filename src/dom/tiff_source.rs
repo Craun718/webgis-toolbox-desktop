@@ -1,6 +1,7 @@
 use super::{
-    geotiff::{Affine, Crs, geometry},
+    geotiff::Affine,
     tiff_mask::{MAX_CHUNK, Mask, RawBlocks},
+    tile_crs::{TileCrs, geometry},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -19,7 +20,7 @@ const CACHE_BYTES: usize = MAX_CHUNK;
 
 pub(super) struct Source {
     pub size: [u32; 2],
-    pub crs: Crs,
+    pub crs: TileCrs,
     pub transform: Affine,
     decoder: Decoder<BufReader<File>>,
     chunk: [u32; 2],

@@ -377,6 +377,209 @@ fn rotated_pixel_is_point_and_area_sampling_preserve_known_pixels() -> Result<()
     Ok(())
 }
 
+fn make_geokey_tiff(path: &Path, entries: &[[u16; 4]], doubles: &[f64]) -> Result<()> {
+    let mut file = TiffEncoder::new(fs::File::create(path)?)?;
+    let mut image = file.new_image::<tiff::encoder::colortype::Gray8>(32, 32)?;
+    write_geotags(
+        image.encoder(),
+        None,
+        Affine([113.9, 0.006, 0., 24.1, 0., -0.006]),
+        false,
+    )?;
+    let mut directory = vec![1_u16, 1, 0, entries.len() as u16];
+    directory.extend(entries.as_flattened());
+    image
+        .encoder()
+        .write_tag(Tag::GeoKeyDirectoryTag, directory.as_slice())?;
+    image
+        .encoder()
+        .write_tag(Tag::GeoDoubleParamsTag, doubles)?;
+    let pixels: Vec<_> = (0..32 * 32).map(|index| (index % 251) as u8).collect();
+    image.write_data(&pixels)?;
+    Ok(())
+}
+
+const CUSTOM_KEYS: [[u16; 4]; 7] = [
+    [1024, 0, 1, 2],
+    [2048, 0, 1, 32767],
+    [2050, 0, 1, 32767],
+    [2054, 0, 1, 9102],
+    [2057, 34736, 1, 0],
+    [2059, 34736, 1, 1],
+    [2061, 34736, 1, 2],
+];
+const CUSTOM_DOUBLES: [f64; 3] = [6_378_137., 298.257_222_101, 0.];
+
+#[test]
+fn tiles_fall_back_to_geographic_geokeys_with_one_warning_per_job() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let cancelled = AtomicBool::new(false);
+    let mut reference = None;
+    for (code, reason) in [
+        (Some(4490), None),
+        (Some(32767), Some("32767")),
+        (Some(0), Some("缺少可识别的 EPSG")),
+        (None, Some("缺少可识别的 EPSG")),
+        (Some(65000), Some("65000")),
+    ] {
+        let name = format!("{code:?}");
+        let input = root.path().join(format!("{name}.tif"));
+        let output = root.path().join(name);
+        let mut keys = CUSTOM_KEYS.to_vec();
+        if let Some(code) = code {
+            keys[1][3] = code;
+        } else {
+            keys.remove(1);
+        }
+        if code == Some(65000) {
+            keys.pop();
+            keys.push([2051, 0, 1, 8901]);
+            keys.sort_unstable();
+        }
+        let mut doubles = CUSTOM_DOUBLES;
+        if reason.is_none() {
+            doubles[0] = f64::NAN; // A valid EPSG takes priority over fallback parameters.
+        }
+        make_geokey_tiff(&input, &keys, &doubles)?;
+        let mut request = tile_request(input.clone(), output.clone(), 12);
+        request.id = Some("geokeys".into());
+        let mut warnings = Vec::new();
+        assert_eq!(
+            run_with_logging(
+                &request,
+                &cancelled,
+                |_| {},
+                |warning| warnings.push(warning.to_owned()),
+                || Ok(()),
+                Some(&pool),
+            )?,
+            vec![12]
+        );
+        if let Some(reason) = reason {
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(input.to_str().unwrap()));
+            assert!(warnings[0].contains(reason), "{}", warnings[0]);
+            assert!(warnings[0].contains("未应用到 WGS84 的基准转换"));
+        } else {
+            assert!(warnings.is_empty());
+        }
+        let mut files = std::collections::BTreeMap::new();
+        for entry in walkdir::WalkDir::new(&output) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                files.insert(
+                    entry.path().strip_prefix(&output)?.to_owned(),
+                    fs::read(entry.path())?,
+                );
+            }
+        }
+        assert!(files.contains_key(Path::new("stacta.json")));
+        assert!(
+            files
+                .keys()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+                .count()
+                > 3
+        );
+        if let Some(reference) = &reference {
+            assert_eq!(reference, &files);
+        } else {
+            reference = Some(files);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_incomplete_or_conflicting_fallback_geokeys() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("invalid.tif");
+    let output = root.path().join("tiles");
+    let mut without_flattening = CUSTOM_KEYS.to_vec();
+    without_flattening.remove(5);
+    for (keys, doubles, reason, fallback) in [
+        (without_flattening, CUSTOM_DOUBLES, "2059", true),
+        (
+            CUSTOM_KEYS.to_vec(),
+            [f64::INFINITY, CUSTOM_DOUBLES[1], 0.],
+            "2057",
+            true,
+        ),
+        (
+            [CUSTOM_KEYS.as_slice(), &[[2051, 0, 1, 8901]]].concat(),
+            [CUSTOM_DOUBLES[0], CUSTOM_DOUBLES[1], 1.],
+            "格林尼治",
+            true,
+        ),
+        (
+            [CUSTOM_KEYS.as_slice(), &[[2058, 34736, 1, 0]]].concat(),
+            CUSTOM_DOUBLES,
+            "2058",
+            true,
+        ),
+        (
+            [CUSTOM_KEYS.as_slice(), &[[2062, 34736, 3, 0]]].concat(),
+            CUSTOM_DOUBLES,
+            "基准转换",
+            true,
+        ),
+        (
+            replaced_geokey(2, [2050, 0, 1, 6269]),
+            CUSTOM_DOUBLES,
+            "基准",
+            true,
+        ),
+        (
+            replaced_geokey(3, [2054, 0, 1, 9101]),
+            CUSTOM_DOUBLES,
+            "角度单位",
+            true,
+        ),
+        (
+            replaced_geokey(0, [1024, 0, 1, 1]),
+            CUSTOM_DOUBLES,
+            "二维地理坐标系",
+            true,
+        ),
+        (
+            replaced_geokey(1, [2048, 0, 1, 3857]),
+            CUSTOM_DOUBLES,
+            "与 GeoKey 坐标类型不符",
+            false,
+        ),
+        (
+            replaced_geokey(1, [2048, 0, 1, 4267]),
+            CUSTOM_DOUBLES,
+            "外部坐标转换格网",
+            false,
+        ),
+    ] {
+        make_geokey_tiff(&input, &keys, &doubles)?;
+        let request = tile_request(input.clone(), output.clone(), 12);
+        let error = run_with_logging(
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            |_| panic!("unexpected warning"),
+            || Ok(()),
+            None,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains(reason), "{error}");
+        assert_eq!(error.contains("无法回退"), fallback, "{error}");
+        assert!(!output.exists());
+    }
+    Ok(())
+}
+
+fn replaced_geokey(index: usize, replacement: [u16; 4]) -> Vec<[u16; 4]> {
+    let mut keys = CUSTOM_KEYS.to_vec();
+    keys[index] = replacement;
+    keys
+}
+
 #[test]
 fn decodes_jpeg_ycbcr_and_sub_ifd_mask() -> Result<()> {
     let root = tempfile::tempdir()?;

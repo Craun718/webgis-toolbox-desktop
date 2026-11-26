@@ -1345,10 +1345,11 @@ impl TileForm {
                     datetime,
                     id: optional_text(&self.id),
                 };
-                let levels = dom::map_tiles::run_with_progress(
+                let levels = dom::map_tiles::run_with_logging(
                     &request,
                     &task.cancelled,
                     |event| task.update(event),
+                    |message| task.warn(message),
                     || task.publish_with_progress(Some(0.95)),
                     pool,
                 )?;

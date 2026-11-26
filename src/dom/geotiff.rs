@@ -142,6 +142,51 @@ impl Affine {
 }
 
 pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
+    geometry_with(tags, |_, keys| keys.epsg())
+}
+
+pub(super) struct GeoKeys<'a>(&'a [u16]);
+
+impl GeoKeys<'_> {
+    pub fn entries(&self) -> impl Iterator<Item = &[u16]> {
+        self.0.chunks_exact(4)
+    }
+
+    pub fn short(&self, id: u16) -> Option<u16> {
+        self.entries().find_map(|entry| {
+            (entry[0] == id && entry[1] == 0 && entry[2] == 1).then_some(entry[3])
+        })
+    }
+
+    pub fn crs_code(&self) -> (Option<u16>, bool) {
+        match self.short(1024) {
+            Some(1) => (self.short(3072), false),
+            Some(2) => (self.short(2048), true),
+            None => self
+                .short(3072)
+                .map_or((self.short(2048), true), |code| (Some(code), false)),
+            _ => (None, false),
+        }
+    }
+
+    pub fn epsg(&self) -> Result<Crs> {
+        let (code, geographic) = self.crs_code();
+        let crs = Crs::from_code(
+            code.filter(|&code| code != 32767 && code != 0)
+                .context(message!(crs_geokey_has_no_recognizable_epsg_identifier))?,
+        )?;
+        ensure!(
+            crs.geographic == geographic,
+            message!(epsg_does_not_match_the_geokey_coordinate_type, crs.code)
+        );
+        Ok(crs)
+    }
+}
+
+pub(super) fn geometry_with<C>(
+    tags: &mut IfdDecoder<'_>,
+    resolve_crs: impl FnOnce(&mut IfdDecoder<'_>, &GeoKeys<'_>) -> Result<C>,
+) -> Result<(C, Affine)> {
     let keys = tags
         .find_tag(Tag::GeoKeyDirectoryTag)?
         .context(message!(missing_crs_geokey))?
@@ -152,25 +197,8 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
     );
     let end = 4 + usize::from(keys[3]) * 4;
     ensure!(end <= keys.len(), message!(geokey_directory_is_incomplete));
-    let key = |id| {
-        keys[4..end].chunks_exact(4).find_map(|entry| {
-            (entry[0] == id && entry[1] == 0 && entry[2] == 1).then_some(entry[3])
-        })
-    };
-    let (code, geographic) = match key(1024) {
-        Some(1) => (key(3072), false),
-        Some(2) => (key(2048), true),
-        None => key(3072).map_or((key(2048), true), |code| (Some(code), false)),
-        _ => (None, false),
-    };
-    let crs = Crs::from_code(
-        code.filter(|&code| code != 32767 && code != 0)
-            .context(message!(crs_geokey_has_no_recognizable_epsg_identifier))?,
-    )?;
-    ensure!(
-        crs.geographic == geographic,
-        message!(epsg_does_not_match_the_geokey_coordinate_type, crs.code)
-    );
+    let keys = GeoKeys(&keys[4..end]);
+    let crs = resolve_crs(tags, &keys)?;
     let mut transform = if let Some(value) = tags.find_tag(Tag::ModelTransformationTag)? {
         let matrix = value.into_f64_vec()?;
         ensure!(
@@ -206,7 +234,7 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(Crs, Affine)> {
             -scale[1],
         ])
     };
-    match key(1025) {
+    match keys.short(1025) {
         None | Some(1) => {}
         Some(2) => {
             let [x, y] = transform.model([-0.5, -0.5]);
