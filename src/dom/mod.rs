@@ -1,6 +1,7 @@
 use webgis_core::task_pool::{self, ThreadPool};
 use webgis_core::{message, osgb_output::OutputLock};
 pub mod cog;
+mod crs_identify;
 mod geotiff;
 pub mod map_tiles;
 mod raster;

@@ -377,7 +377,12 @@ fn rotated_pixel_is_point_and_area_sampling_preserve_known_pixels() -> Result<()
     Ok(())
 }
 
-fn make_geokey_tiff(path: &Path, entries: &[[u16; 4]], doubles: &[f64]) -> Result<()> {
+fn make_geokey_tiff(
+    path: &Path,
+    entries: &[[u16; 4]],
+    doubles: &[f64],
+    ascii: Option<&str>,
+) -> Result<()> {
     let mut file = TiffEncoder::new(fs::File::create(path)?)?;
     let mut image = file.new_image::<tiff::encoder::colortype::Gray8>(32, 32)?;
     write_geotags(
@@ -394,8 +399,115 @@ fn make_geokey_tiff(path: &Path, entries: &[[u16; 4]], doubles: &[f64]) -> Resul
     image
         .encoder()
         .write_tag(Tag::GeoDoubleParamsTag, doubles)?;
+    if let Some(ascii) = ascii {
+        image.encoder().write_tag(Tag::GeoAsciiParamsTag, ascii)?;
+    }
     let pixels: Vec<_> = (0..32 * 32).map(|index| (index % 251) as u8).collect();
     image.write_data(&pixels)?;
+    Ok(())
+}
+
+const CGCS2000_KEYS: [[u16; 4]; 10] = [
+    [1024, 0, 1, 2],
+    [1025, 0, 1, 1],
+    [2048, 0, 1, 32767],
+    [2049, 34737, 65, 0],
+    [2050, 0, 1, 32767],
+    [2054, 0, 1, 9102],
+    [2056, 0, 1, 1024],
+    [2057, 34736, 1, 1],
+    [2059, 34736, 1, 0],
+    [2061, 34736, 1, 2],
+];
+const CGCS2000_DOUBLES: [f64; 3] = [298.257_222_101_004, 6_378_137., 0.];
+const CGCS2000_CITATION: &str = "GCS Name = GCS_CGCS_2000|Datum = D_CGCS_2000|Primem = Greenwich||";
+
+#[test]
+fn tiles_identify_cgcs2000_from_user_defined_geotiff_keys() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let cancelled = AtomicBool::new(false);
+    let mut reference = None;
+    for (name, code) in [("identified", 32767), ("explicit", 4490)] {
+        let input = root.path().join(format!("{name}.tif"));
+        let output = root.path().join(name);
+        let mut keys = CGCS2000_KEYS;
+        keys[2][3] = code;
+        make_geokey_tiff(&input, &keys, &CGCS2000_DOUBLES, Some(CGCS2000_CITATION))?;
+        assert!(matches!(
+            Source::open(&input)?.crs,
+            TileCrs::Epsg(Crs {
+                code: 4490,
+                geographic: true
+            })
+        ));
+        let mut request = tile_request(input, output.clone(), 12);
+        request.id = Some("cgcs2000".into());
+        let mut warning = None;
+        assert_eq!(
+            run_with_logging(
+                &request,
+                &cancelled,
+                |_| {},
+                |msg| warning = Some(msg.to_owned()),
+                || Ok(()),
+                Some(&pool)
+            )?,
+            vec![12],
+        );
+        assert_eq!(warning, None);
+        let (x, y, _, _) = locate(
+            [
+                HALF_WORLD * 114. / 180.,
+                6_378_137. * 24_f64.to_radians().tan().asinh(),
+            ],
+            12,
+        );
+        let tile = fs::read(output.join(relative_path(12, x, y, "png")))?;
+        if let Some(reference) = &reference {
+            assert_eq!(reference, &tile);
+        } else {
+            reference = Some(tile);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn keeps_fallback_for_unidentified_or_conflicting_geotiff_evidence() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("source.tif");
+    let extra = format!("{CGCS2000_CITATION}Other CRS|");
+    let conflict = CGCS2000_CITATION.replace("D_CGCS_2000", "Other datum");
+    for (code, datum, start, count, ascii, expected) in [
+        (32767, 32767, 0, 65, None, None),
+        (
+            32767,
+            32767,
+            0,
+            conflict.len() as u16,
+            Some(conflict.as_str()),
+            None,
+        ),
+        (32767, 32767, 65, 10, Some(extra.as_str()), None),
+        (32767, 32767, 0, 66, Some(CGCS2000_CITATION), None),
+        (65000, 32767, 0, 65, Some(CGCS2000_CITATION), None),
+        (4326, 32767, 0, 65, Some(CGCS2000_CITATION), Some(4326)),
+        (32767, 1043, 0, 65, None, Some(4490)),
+    ] {
+        let mut keys = CGCS2000_KEYS;
+        keys[2][3] = code;
+        keys[3] = [2049, 34737, count, start];
+        keys[4][3] = datum;
+        make_geokey_tiff(&input, &keys, &CGCS2000_DOUBLES, ascii)?;
+        match (Source::open(&input)?.crs, expected) {
+            (TileCrs::Epsg(crs), Some(expected)) => assert_eq!(crs.code, expected),
+            (TileCrs::Geographic { reason, .. }, None) => {
+                assert!(reason.contains(&code.to_string()))
+            }
+            _ => panic!("unexpected CRS resolution: {code}/{datum}/{start}/{count}"),
+        }
+    }
     Ok(())
 }
 
@@ -441,7 +553,7 @@ fn tiles_fall_back_to_geographic_geokeys_with_one_warning_per_job() -> Result<()
         if reason.is_none() {
             doubles[0] = f64::NAN; // A valid EPSG takes priority over fallback parameters.
         }
-        make_geokey_tiff(&input, &keys, &doubles)?;
+        make_geokey_tiff(&input, &keys, &doubles, None)?;
         let mut request = tile_request(input.clone(), output.clone(), 12);
         request.id = Some("geokeys".into());
         let mut warnings = Vec::new();
@@ -555,7 +667,7 @@ fn rejects_incomplete_or_conflicting_fallback_geokeys() -> Result<()> {
             false,
         ),
     ] {
-        make_geokey_tiff(&input, &keys, &doubles)?;
+        make_geokey_tiff(&input, &keys, &doubles, None)?;
         let request = tile_request(input.clone(), output.clone(), 12);
         let error = run_with_logging(
             &request,
