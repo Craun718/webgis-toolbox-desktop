@@ -138,6 +138,14 @@ impl TaskContext {
             .log(console::Level::Info, message);
     }
 
+    pub(super) fn warn(&self, message: &str) {
+        self.control
+            .state
+            .lock()
+            .unwrap()
+            .log(console::Level::Warn, message);
+    }
+
     pub(super) fn publish(&self) -> Result<()> {
         self.publish_with_progress(None)
     }
@@ -374,8 +382,12 @@ impl TaskWindow {
             job.wrap.max_width = wrap_width;
             let normal = egui::TextFormat::simple(font_id.clone(), ui.visuals().text_color());
             let error = egui::TextFormat::simple(font_id.clone(), ui.visuals().error_fg_color);
+            let warning = egui::TextFormat::simple(font_id.clone(), ui.visuals().warn_fg_color);
             for line in text.as_str().split_inclusive('\n') {
-                if let Some(body) = line.strip_prefix(console::Level::ERROR_LABEL) {
+                if let Some(body) = line.strip_prefix(console::Level::WARN_LABEL) {
+                    job.append(console::Level::WARN_LABEL, 0.0, warning.clone());
+                    job.append(body, 0.0, normal.clone());
+                } else if let Some(body) = line.strip_prefix(console::Level::ERROR_LABEL) {
                     job.append(console::Level::ERROR_LABEL, 0.0, error.clone());
                     job.append(body, 0.0, normal.clone());
                 } else {

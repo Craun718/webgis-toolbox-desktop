@@ -471,6 +471,27 @@ macro_rules! message {
     (time_rfc_3339) => {
         $crate::localized_template!("时间（RFC 3339）", "Time (RFC 3339)", "日時（RFC 3339）")
     };
+    (time_optional_rfc_3339) => {
+        $crate::localized_template!("时间（可选，RFC 3339）", "Time (optional, RFC 3339)", "日時（任意、RFC 3339）")
+    };
+    (time_blank_uses_current_time_rfc_3339) => {
+        $crate::localized_template!("留空自动使用当前时间；例如 2026-01-01T00:00:00Z", "Leave blank for the current time; e.g. 2026-01-01T00:00:00Z", "空欄の場合は現在時刻を使用。例: 2026-01-01T00:00:00Z")
+    };
+    (map_tiles_time_blank_hint) => {
+        $crate::localized_template!("留空优先读取 GeoTIFF 时间；否则使用当前时间", "Leave blank to prefer the GeoTIFF time; otherwise use the current time", "空欄の場合は GeoTIFF の日時を優先し、なければ現在時刻を使用")
+    };
+    (geotiff_datetime_invalid_use_current, $($args:tt)+) => {
+        $crate::localized_template!("GeoTIFF 时间元数据无效（{}），已使用当前时间。", "Invalid GeoTIFF datetime metadata ({}); using the current time.", "GeoTIFF の日時メタデータが無効（{}）のため、現在時刻を使用しました。"; $($args)+)
+    };
+    (tile_datetime_fallback_current) => {
+        $crate::localized_template!("时间不可用，已使用当前时间。", "No usable datetime; using the current time.", "利用可能な日時がないため、現在時刻を使用しました。")
+    };
+    (geotiff_datetime_missing_use_current) => {
+        $crate::localized_template!("GeoTIFF 没有时间元数据，已使用当前时间。", "The GeoTIFF has no datetime metadata; using the current time.", "GeoTIFF に日時メタデータがないため、現在時刻を使用しました。")
+    };
+    (tile_datetime_missing_use_current) => {
+        $crate::localized_template!("未填写时间，已使用当前时间。", "No datetime was entered; using the current time.", "日時が未入力のため、現在時刻を使用しました。")
+    };
     (e_g_2026_01_01t00_00_00z) => {
         $crate::localized_template!("例如 2026-01-01T00:00:00Z", "e.g. 2026-01-01T00:00:00Z", "例: 2026-01-01T00:00:00Z")
     };

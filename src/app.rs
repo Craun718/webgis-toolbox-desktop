@@ -640,6 +640,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tile_datetime_prefers_geotiff_metadata_and_warns_on_fallback() {
+        let metadata = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let manual = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z").unwrap();
+
+        let selected = resolve_tile_datetime(
+            dom::map_tiles::MetadataTime::Found(metadata),
+            Some(manual),
+            |_| panic!("valid GeoTIFF time should not warn"),
+        );
+        assert_eq!(selected, metadata);
+
+        let mut warnings = Vec::new();
+        let selected = resolve_tile_datetime(
+            dom::map_tiles::MetadataTime::Invalid("bad time".into()),
+            None,
+            |message| warnings.push(message.to_owned()),
+        );
+        assert!(selected <= chrono::Local::now().fixed_offset());
+        assert!(warnings.iter().any(|message| message.contains("bad time")));
+
+        let selected = resolve_tile_datetime(
+            dom::map_tiles::MetadataTime::Invalid("bad time".into()),
+            Some(manual),
+            |message| warnings.push(message.to_owned()),
+        );
+        assert_eq!(selected, manual);
+
+        let before = chrono::Local::now().fixed_offset();
+        let datetime =
+            resolve_tile_datetime(dom::map_tiles::MetadataTime::Missing, None, |message| {
+                warnings.push(message.to_owned())
+            });
+        let after = chrono::Local::now().fixed_offset();
+        assert!(datetime >= before && datetime <= after);
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("没有时间元数据"))
+        );
+
+        assert_eq!(
+            optional_tile_datetime("2026-01-01T00:00:00Z")
+                .unwrap()
+                .unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap()
+        );
+        assert!(optional_tile_datetime("not-a-date").is_err());
+    }
+
+    #[test]
     fn mosaic_option_controls_internal_overviews() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let input = dir.path().join("tiles");
@@ -700,6 +750,38 @@ fn required_path(label: &str, value: &str) -> Result<PathBuf> {
 
 fn optional_text(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+fn optional_tile_datetime(value: &str) -> Result<Option<chrono::DateTime<chrono::FixedOffset>>> {
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        chrono::DateTime::parse_from_rfc3339(value.trim())
+            .context(message!(time_must_follow_rfc_3339))
+            .map(Some)
+    }
+}
+
+fn resolve_tile_datetime(
+    metadata: dom::map_tiles::MetadataTime,
+    manual: Option<chrono::DateTime<chrono::FixedOffset>>,
+    mut warn: impl FnMut(&str),
+) -> chrono::DateTime<chrono::FixedOffset> {
+    match metadata {
+        dom::map_tiles::MetadataTime::Found(datetime) => datetime,
+        dom::map_tiles::MetadataTime::Invalid(value) => {
+            if let Some(manual) = manual {
+                manual
+            } else {
+                warn(&message!(geotiff_datetime_invalid_use_current, value));
+                chrono::Local::now().fixed_offset()
+            }
+        }
+        dom::map_tiles::MetadataTime::Missing => manual.unwrap_or_else(|| {
+            warn(&message!(geotiff_datetime_missing_use_current));
+            chrono::Local::now().fixed_offset()
+        }),
+    }
 }
 
 fn optional_path(value: &str) -> Option<PathBuf> {
@@ -1089,9 +1171,9 @@ impl TileForm {
             TileOp::Stacta => {
                 field(
                     ui,
-                    message!(time_rfc_3339),
+                    message!(time_optional_rfc_3339),
                     &mut self.datetime,
-                    message!(e_g_2026_01_01t00_00_00z),
+                    message!(time_blank_uses_current_time_rfc_3339),
                 );
                 field(
                     ui,
@@ -1127,9 +1209,9 @@ impl TileForm {
                 });
                 field(
                     ui,
-                    message!(time_rfc_3339),
+                    message!(time_optional_rfc_3339),
                     &mut self.datetime,
-                    message!(e_g_2026_01_01t00_00_00z),
+                    message!(map_tiles_time_blank_hint),
                 );
                 field(
                     ui,
@@ -1237,8 +1319,13 @@ impl TileForm {
                 } else {
                     None
                 };
-                let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
-                    .context(message!(time_must_follow_rfc_3339))?;
+                let datetime = match optional_tile_datetime(&self.datetime)? {
+                    Some(datetime) => datetime,
+                    None => {
+                        task.warn(&message!(tile_datetime_missing_use_current));
+                        chrono::Local::now().fixed_offset()
+                    }
+                };
                 task.update(TaskProgress::new(
                     Phase::CreateStacta,
                     message!(validate_tiles_and_generate_stacta),
@@ -1257,8 +1344,10 @@ impl TileForm {
             }
             TileOp::MapTiles => {
                 let output = required_path(message!(output_folder), &self.output)?;
-                let datetime = chrono::DateTime::parse_from_rfc3339(self.datetime.trim())
-                    .context(message!(time_must_follow_rfc_3339))?;
+                let manual_datetime = optional_tile_datetime(&self.datetime)?;
+                let metadata = dom::map_tiles::metadata_datetime(&input)?;
+                let datetime =
+                    resolve_tile_datetime(metadata, manual_datetime, |message| task.warn(message));
                 let request = dom::map_tiles::Request {
                     input,
                     output: output.clone(),

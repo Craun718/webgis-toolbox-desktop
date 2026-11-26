@@ -13,16 +13,19 @@ enum Terminal {
 #[derive(Clone, Copy)]
 pub enum Level {
     Info,
+    Warn,
     Error,
 }
 
 impl Level {
     pub const ERROR_LABEL: &str = "[ERRO]";
+    pub const WARN_LABEL: &str = "[WARN]";
 }
 
 pub fn record(level: Level, source: &str, message: &str) -> String {
     let label = match level {
         Level::Info => "[INFO]",
+        Level::Warn => "[WARN]",
         Level::Error => Level::ERROR_LABEL,
     };
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -30,6 +33,7 @@ pub fn record(level: Level, source: &str, message: &str) -> String {
     let line = format!("{label} {body}");
     let write_line = |writer: &mut dyn Write| match level {
         Level::Info => writeln!(writer, "{line}"),
+        Level::Warn => writeln!(writer, "\x1b[33m{label}\x1b[0m {body}"),
         Level::Error => writeln!(writer, "\x1b[31m{label}\x1b[0m {body}"),
     };
     static TERMINAL: OnceLock<Terminal> = OnceLock::new();

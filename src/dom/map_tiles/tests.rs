@@ -47,7 +47,7 @@ fn world_transform() -> Affine {
     Affine([-HALF_WORLD, step, 0., HALF_WORLD, 0., -step])
 }
 
-fn make_alpha(path: &Path, gray: bool) -> Result<()> {
+fn make_alpha(path: &Path, gray: bool, datetime: Option<&str>) -> Result<()> {
     use tiff::{
         encoder::colortype::{ColorType, RGBA8},
         tags::{PhotometricInterpretation, SampleFormat},
@@ -88,6 +88,9 @@ fn make_alpha(path: &Path, gray: bool) -> Result<()> {
         image.rows_per_strip(64)?;
         write_geotags(image.encoder(), crs, world_transform(), false)?;
         image.encoder().write_tag(Tag::ExtraSamples, 2_u16)?;
+        if let Some(datetime) = datetime {
+            image.encoder().write_tag(Tag::DateTime, datetime)?;
+        }
         image.write_data(&values)?;
     } else {
         let mut image = file.new_image::<RGBA8>(512, 512)?;
@@ -96,6 +99,28 @@ fn make_alpha(path: &Path, gray: bool) -> Result<()> {
         image.encoder().write_tag(Tag::ExtraSamples, 2_u16)?;
         image.write_data(&values)?;
     }
+    Ok(())
+}
+
+#[test]
+fn reads_tiff_datetime_and_handles_missing_or_invalid_values() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("metadata.tif");
+    make_alpha(&input, true, Some("2024:05:06 12:34:56"))?;
+    let MetadataTime::Found(datetime) = metadata_datetime(&input)? else {
+        panic!("expected TIFF datetime");
+    };
+    assert_eq!(
+        datetime.format("%Y:%m:%d %H:%M:%S").to_string(),
+        "2024:05:06 12:34:56"
+    );
+    make_alpha(&input, true, Some("invalid"))?;
+    assert!(matches!(
+        metadata_datetime(&input)?,
+        MetadataTime::Invalid(_)
+    ));
+    make_alpha(&input, true, None)?;
+    assert_eq!(metadata_datetime(&input)?, MetadataTime::Missing);
     Ok(())
 }
 
@@ -139,7 +164,7 @@ fn check_tiling(crs: &str, transform: [f64; 6], prefix: &str) -> Result<()> {
 fn check_alpha_layout(gray: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let input = root.path().join("alpha.tif");
-    make_alpha(&input, gray)?;
+    make_alpha(&input, gray, None)?;
     let output = root.path().join("tiles");
     let request = Request {
         input,

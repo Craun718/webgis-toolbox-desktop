@@ -3,9 +3,9 @@ use super::{
     tile_sampling::Grid,
 };
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone};
 use image::RgbaImage;
-use std::{path::PathBuf, sync::atomic::AtomicBool};
+use std::{fs::File, io::BufReader, path::Path, path::PathBuf, sync::atomic::AtomicBool};
 use tiles_toolbox::{
     stacta,
     tiles::{Bounds, HALF_WORLD, publish_directory, relative_path, tile_span},
@@ -15,6 +15,14 @@ use webgis_core::task_pool::{self, ThreadPool};
 
 pub const MAX_ZOOM: u8 = 23;
 
+/// TIFF 6.0 DateTime is optional and contains no UTC offset.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetadataTime {
+    Found(DateTime<FixedOffset>),
+    Invalid(String),
+    Missing,
+}
+
 pub struct Request {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -22,6 +30,30 @@ pub struct Request {
     pub max_zoom: u8,
     pub datetime: DateTime<FixedOffset>,
     pub id: Option<String>,
+}
+
+pub fn metadata_datetime(input: &Path) -> Result<MetadataTime> {
+    let mut decoder = tiff::decoder::Decoder::new(BufReader::new(File::open(input)?))
+        .with_context(|| message!(could_not_read, input.display()))?;
+    let raw = match decoder.image_ifd().find_tag(tiff::tags::Tag::DateTime) {
+        Ok(None) => return Ok(MetadataTime::Missing),
+        Ok(Some(value)) => match value.into_string() {
+            Ok(value) => value,
+            Err(error) => return Ok(MetadataTime::Invalid(error.to_string())),
+        },
+        Err(error) => return Ok(MetadataTime::Invalid(error.to_string())),
+    };
+    let text = raw.trim_matches('\0').trim();
+    if text.is_empty() {
+        return Ok(MetadataTime::Missing);
+    }
+    let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y:%m:%d %H:%M:%S") else {
+        return Ok(MetadataTime::Invalid(text.to_owned()));
+    };
+    let Some(local) = Local.from_local_datetime(&naive).earliest() else {
+        return Ok(MetadataTime::Invalid(text.to_owned()));
+    };
+    Ok(MetadataTime::Found(local.fixed_offset()))
 }
 
 pub fn run(
