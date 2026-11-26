@@ -18,15 +18,6 @@ cargo run --locked
 
 在 [GitHub Releases](https://github.com/Craun718/webgis-toolbox-desktop/releases) 下载对应平台的压缩包，完整解压，保留可执行文件旁的 `fonts/` 目录。
 
-发版时，在包含发版工作流的提交上创建并推送新版本 tag：
-
-```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
-```
-
-三个平台均构建成功且字体测试通过后，GitHub Actions 会发布 Windows x86_64、Linux x86_64 和 macOS arm64 的压缩包。`v0.1.0-rc.1` 这类 tag 会发布为预发行版。普通分支推送和 PR 不会发版。
-
 ## 工具
 
 - **OSGB 转 DOM / DSM** 的模型输入可选择根 OSGB 文件或 `metadata.xml`。选择 `metadata.xml` 时优先从同目录的 `Block.osgb` 进入。转换器沿 PagedLOD 引用遍历场景树，保留各分支的叶节点几何，支持分支在不同 LOD 终止。无 `Block.osgb` 的目录会递归扫描文件，对符合 ContextCapture 命名约定的分片按模型组选最高 LOD。支持预检所选文件、LOD、坐标模式、范围和栅格尺寸。相对原点模式从 `metadata.xml` 读取坐标系及原点，支持手动覆盖。绝对坐标模式直接使用模型坐标，本地模式生成无 CRS 的栅格。默认像元尺寸为 0.05 个坐标单位。
