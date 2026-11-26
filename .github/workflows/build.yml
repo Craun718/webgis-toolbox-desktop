@@ -53,6 +53,12 @@ jobs:
       - name: Test CJK font loading
         run: cargo test --release --locked --bin webgis-toolbox app::fonts::tests
 
+      - name: Test CRS identification and map tile fallback
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --release --locked --lib dom::geotiff::tests
+          cargo test --release --locked --lib dom::map_tiles::tests
+
       - name: Prepare distribution
         shell: bash
         run: |

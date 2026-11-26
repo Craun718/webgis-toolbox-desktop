@@ -1,3 +1,4 @@
+use super::crs_identify::cgcs2000_wkt;
 use anyhow::{Context, Result, ensure};
 use proj4rs::proj::Proj;
 use regex::Regex;
@@ -16,7 +17,7 @@ impl Crs {
         let value = value.trim().trim_start_matches('\u{feff}').trim();
         let code = match value.split_once(':') {
             Some((prefix, code)) if prefix.eq_ignore_ascii_case("EPSG") => code.trim().parse().ok(),
-            _ => wkt_epsg(value),
+            _ => wkt_epsg(value).or_else(|| cgcs2000_wkt(value)),
         };
         Self::from_code(code.with_context(|| {
             message!(
@@ -292,6 +293,47 @@ pub(super) fn write_geotags<W: std::io::Write + std::io::Seek, K: tiff::encoder:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CGCS2000_WKT: &str = concat!(
+        r#"GEOGCRS["GCS_CGCS_2000",DATUM["D_CGCS_2000",ELLIPSOID["CGCS2000",6378137,298.257222101004,LENGTHUNIT["metre",1],ID["EPSG",1024]]],"#,
+        r#"PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433,ID["EPSG",9122]]],CS[ellipsoidal,2],"#,
+        r#"AXIS["latitude",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433,ID["EPSG",9122]]],"#,
+        r#"AXIS["longitude",east,ORDER[2],ANGLEUNIT["degree",0.0174532925199433,ID["EPSG",9122]]]]"#,
+    );
+
+    #[test]
+    fn identifies_unlabelled_cgcs2000_wkt_without_overriding_explicit_authority() {
+        let identified = Crs::parse(CGCS2000_WKT).unwrap();
+        assert_eq!(identified.code, 4490);
+        assert!(identified.geographic);
+        let explicit = format!(
+            r#"{},ID["EPSG",4326]]"#,
+            CGCS2000_WKT.strip_suffix(']').unwrap()
+        );
+        assert_eq!(Crs::parse(&explicit).unwrap().code, 4326);
+        let unknown = explicit.replace("4326", "65534");
+        assert!(Crs::parse(&unknown).is_err());
+        let invalid = explicit.replace("4326", "99999");
+        assert!(Crs::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn does_not_infer_from_an_ellipsoid_or_conflicting_wkt_metadata() {
+        for (before, after) in [
+            ("D_CGCS_2000", "Other datum"),
+            ("GCS_CGCS_2000", "Other geographic CRS"),
+            ("GEOGCRS[", "PROJCRS["),
+            ("ellipsoidal,2", "ellipsoidal,3"),
+            ("Greenwich\",0", "Greenwich\",1"),
+            ("0.0174532925199433", "0.0157079632679489"),
+            ("ID[\"EPSG\",1024]", "ID[\"EPSG\",7019]"),
+            ("ORDER[2]", "ORDER[2)"),
+        ] {
+            let wkt = CGCS2000_WKT.replace(before, after);
+            assert_ne!(wkt, CGCS2000_WKT);
+            assert!(Crs::parse(&wkt).is_err(), "{wkt}");
+        }
+    }
 
     #[test]
     fn resolves_only_top_level_wkt_epsg() {

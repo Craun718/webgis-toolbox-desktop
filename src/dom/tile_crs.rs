@@ -1,3 +1,6 @@
+use super::crs_identify::{
+    CGCS2000, CGCS2000_ELLIPSOID, CHINA_2000_DATUM, cgcs2000_crs_name, china_2000_datum_name,
+};
 use super::geotiff::{Affine, Crs, GeoKeys, geometry_with};
 use anyhow::{Context, Result, ensure};
 use proj4rs::proj::Proj;
@@ -13,7 +16,8 @@ pub(super) enum TileCrs {
 
 pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(TileCrs, Affine)> {
     geometry_with(tags, |tags, keys| {
-        let reason = match keys.crs_code().0 {
+        let (code, _) = keys.crs_code();
+        let reason = match code {
             Some(USER_DEFINED) => message!(tile_crs_user_defined).to_owned(),
             Some(code) if code != 0 => {
                 if crs_definitions::from_code(code).is_some() {
@@ -23,13 +27,97 @@ pub(super) fn geometry(tags: &mut IfdDecoder<'_>) -> Result<(TileCrs, Affine)> {
             }
             _ => message!(crs_geokey_has_no_recognizable_epsg_identifier).to_owned(),
         };
+        if matches!(code, None | Some(0 | USER_DEFINED))
+            && identifies_cgcs2000(tags, keys)
+            && geographic_parameters(tags, keys, Some(CHINA_2000_DATUM)).is_ok()
+        {
+            return Crs::from_code(CGCS2000).map(TileCrs::Epsg);
+        }
         let projection = geographic_projection(tags, keys)
             .with_context(|| message!(tile_crs_fallback_failed, reason = reason))?;
         Ok(TileCrs::Geographic { projection, reason })
     })
 }
 
+fn identifies_cgcs2000(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> bool {
+    // The ellipsoid shape is not a datum identifier (GRS 1980 has the same
+    // parameters). Require the named CGCS2000 ellipsoid plus datum evidence.
+    if keys.short(2056) != Some(CGCS2000_ELLIPSOID) {
+        return false;
+    }
+    match keys.short(2050) {
+        Some(CHINA_2000_DATUM) => true,
+        None | Some(USER_DEFINED) => {
+            geodetic_citation(tags, keys).is_some_and(|citation| cgcs2000_citation(&citation))
+        }
+        _ => false,
+    }
+}
+
+fn geodetic_citation(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> Option<String> {
+    let [_, 34737, count, offset] = keys.entries().find(|key| key[0] == 2049)? else {
+        return None;
+    };
+    // Offsets and counts are bytes in the shared GeoAsciiParamsTag. Do not
+    // use strings belonging to another GeoKey as evidence for this CRS.
+    let ascii = tags
+        .find_tag(Tag::GeoAsciiParamsTag)
+        .ok()??
+        .into_string()
+        .ok()?;
+    let offset = usize::from(*offset);
+    let end = offset + usize::from(*count);
+    let citation = ascii.get(offset..end)?.strip_suffix('|')?;
+    Some(citation.to_owned())
+}
+
+fn cgcs2000_citation(citation: &str) -> bool {
+    if cgcs2000_crs_name(citation.trim()) {
+        return true;
+    }
+    // GDAL/Esri commonly store a pipe-delimited key/value citation.
+    let mut crs = None;
+    let mut datum = None;
+    for field in citation.split('|').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((key, value)) = field.split_once('=') else {
+            return false;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("GCS Name") {
+            if crs.replace(cgcs2000_crs_name(value)).is_some() {
+                return false;
+            }
+        } else if key.eq_ignore_ascii_case("Datum") {
+            if datum.replace(china_2000_datum_name(value)).is_some() {
+                return false;
+            }
+        } else if key.eq_ignore_ascii_case("Primem") && !value.eq_ignore_ascii_case("Greenwich") {
+            return false;
+        } else if key.eq_ignore_ascii_case("Ellipsoid") && !value.eq_ignore_ascii_case("CGCS2000") {
+            return false;
+        } else if key.eq_ignore_ascii_case("AUnits")
+            && !value.eq_ignore_ascii_case("Degree")
+            && !value.eq_ignore_ascii_case("Degrees")
+        {
+            return false;
+        }
+    }
+    crs != Some(false) && datum != Some(false) && (crs == Some(true) || datum == Some(true))
+}
+
 fn geographic_projection(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> Result<Proj> {
+    let (axis, inverse_flattening) = geographic_parameters(tags, keys, None)?;
+    Proj::from_proj_string(&format!(
+        "+proj=longlat +a={axis} +rf={inverse_flattening} +pm=0"
+    ))
+    .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn geographic_parameters(
+    tags: &mut IfdDecoder<'_>,
+    keys: &GeoKeys<'_>,
+    known_datum: Option<u16>,
+) -> Result<(f64, f64)> {
     let mut entries = std::collections::BTreeMap::new();
     for entry in keys.entries() {
         let id = entry[0];
@@ -54,8 +142,10 @@ fn geographic_projection(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> Resul
         message!(tile_crs_requires_geographic_2d)
     );
     short(2048)?;
+    let datum = short(2050)?;
     ensure!(
-        matches!(short(2050)?, None | Some(USER_DEFINED)) && !entries.contains_key(&2062),
+        (datum.is_none() || datum == Some(USER_DEFINED) || datum == known_datum)
+            && !entries.contains_key(&2062),
         message!(tile_crs_unsupported_datum)
     );
     ensure!(
@@ -113,8 +203,8 @@ fn geographic_projection(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> Resul
     // An authority ellipsoid is an additional constraint on the explicit parameters.
     let expected_flattening = match short(2056)? {
         None | Some(USER_DEFINED) => None,
-        Some(1024 | 7019) => Some(298.257_222_101), // CGCS2000 / GRS 1980
-        Some(7030) => Some(298.257_223_563),        // WGS 84
+        Some(CGCS2000_ELLIPSOID | 7019) => Some(298.257_222_101), // CGCS2000 / GRS 1980
+        Some(7030) => Some(298.257_223_563),                      // WGS 84
         _ => anyhow::bail!(invalid(2056)),
     };
     ensure!(
@@ -122,10 +212,7 @@ fn geographic_projection(tags: &mut IfdDecoder<'_>, keys: &GeoKeys<'_>) -> Resul
             .is_none_or(|expected| close(axis, 6_378_137.) && close(inverse_flattening, expected)),
         invalid(2056)
     );
-    Proj::from_proj_string(&format!(
-        "+proj=longlat +a={axis} +rf={inverse_flattening} +pm=0"
-    ))
-    .map_err(|error| anyhow::anyhow!("{error}"))
+    Ok((axis, inverse_flattening))
 }
 
 fn close(a: f64, b: f64) -> bool {
